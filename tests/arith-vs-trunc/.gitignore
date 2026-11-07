@@ -1,0 +1,6 @@
+# Generated arith-vs-trunc artifacts
+results/
+run_logs/
+data/
+__pycache__/
+*.pyc

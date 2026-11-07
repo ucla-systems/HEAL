@@ -1,0 +1,766 @@
+diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
+index 7fa804587..429b3237e 100644
+--- a/vllm/model_executor/layers/layernorm.py
++++ b/vllm/model_executor/layers/layernorm.py
+@@ -18,6 +18,15 @@ from vllm.platforms import current_platform
+ logger = init_logger(__name__)
+
+
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ def _can_view_as_2d(x: torch.Tensor) -> bool:
+     """Return True if x.view(-1, x.shape[-1]) is viewable (no copy)."""
+     if x.dim() < 2:
+@@ -271,12 +280,15 @@ class RMSNorm(CustomOp):
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         """PyTorch-native implementation equivalent to forward()."""
+
++        weight = self.weight.data if self.has_weight else None
++        if _layercast_enabled() and weight is not None:
++            weight = weight.to(torch.float32)
+         return self.forward_static(
+             x,
+             self.variance_epsilon,
+             self.hidden_size,
+             x.dtype,
+-            self.weight.data if self.has_weight else None,
++            weight,
+             residual,
+             self.variance_size_override,
+         )
+@@ -288,6 +300,13 @@ class RMSNorm(CustomOp):
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         if self.variance_size_override is not None:
+             return self.forward_native(x, residual)
++        if _layercast_enabled() and self.has_weight:
++            weight = self.weight.data.to(torch.float32)
++            if residual is not None:
++                return fused_add_rms_norm(
++                    x, residual, weight, self.variance_epsilon
++                )
++            return rms_norm(x, weight, self.variance_epsilon)
+
+         # Optional Oink SM100 fast path (no residual). This path is
+         # torch.compile-friendly via torch.ops.oink.rmsnorm and preserves
+@@ -373,6 +392,13 @@ class RMSNorm(CustomOp):
+             return self.forward_native(x, residual)
+
+         add_residual = residual is not None
++        if _layercast_enabled() and self.has_weight:
++            weight = self.weight.data
++            mixed_norm_dtype = x.dtype != weight.dtype or (
++                residual is not None and residual.dtype != x.dtype
++            )
++            if mixed_norm_dtype:
++                return self.forward_native(x, residual)
+         if add_residual:
+             return self.rocm_norm_func_with_add(
+                 x, residual, self.weight.data, self.variance_epsilon
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 44fd516f5..d8b662710 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -5,6 +5,7 @@ import itertools
+ from abc import abstractmethod
+
+ import torch
++import torch.nn.functional as F
+ from torch.nn.parameter import Parameter, UninitializedParameter
+
+ import vllm.envs as envs
+@@ -42,6 +43,15 @@ from vllm.platforms import current_platform
+
+ logger = init_logger(__name__)
+
++
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
+ WEIGHT_LOADER_V2_SUPPORTED = [
+     "UnquantizedLinearMethod",
+     "CompressedTensorsLinearMethod",
+@@ -223,6 +233,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if _layercast_enabled() and torch.is_floating_point(x):
++            weight = layer.weight
++            if torch.is_floating_point(weight):
++                bias = None if bias is None else bias.to(torch.float32)
++                return F.linear(x.to(torch.float32), weight.to(torch.float32), bias)
+         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+             return linear_batch_invariant(x, layer.weight, bias)
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+diff --git a/vllm/model_executor/layers/rotary_embedding/__init__.py b/vllm/model_executor/layers/rotary_embedding/__init__.py
+index 28157daab..b4263c96a 100644
+--- a/vllm/model_executor/layers/rotary_embedding/__init__.py
++++ b/vllm/model_executor/layers/rotary_embedding/__init__.py
+@@ -26,6 +26,15 @@ from .yarn_scaling_rope import YaRNScalingRotaryEmbedding
+ _ROPE_DICT: dict[tuple[Any, ...], RotaryEmbedding] = {}
+
+
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ def get_rope(
+     head_size: int,
+     max_position: int,
+@@ -34,7 +43,9 @@ def get_rope(
+     dtype: torch.dtype | None = None,
+     dual_chunk_attention_config: dict[str, Any] | None = None,
+ ) -> RotaryEmbedding:
+-    if dtype is None:
++    if _layercast_enabled():
++        dtype = torch.float32
++    elif dtype is None:
+         dtype = torch.get_default_dtype()
+     if rope_parameters is not None:
+         # Transforms every value that is a list into a tuple for caching calls
+diff --git a/vllm/model_executor/layers/rotary_embedding/base.py b/vllm/model_executor/layers/rotary_embedding/base.py
+index 1374334b2..0e1c297b7 100644
+--- a/vllm/model_executor/layers/rotary_embedding/base.py
++++ b/vllm/model_executor/layers/rotary_embedding/base.py
+@@ -10,6 +10,15 @@ from vllm.model_executor.custom_op import CustomOp
+ from .common import ApplyRotaryEmb
+
+
++def _layercast_keep_fp32_rope_cache() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ # --8<-- [start:rotary_embedding]
+ @CustomOp.register("rotary_embedding")
+ class RotaryEmbeddingBase(CustomOp):
+@@ -101,6 +110,13 @@ class RotaryEmbeddingBase(CustomOp):
+         ):
+             return cos_sin_cache
+
++        if (
++            cos_sin_cache.dtype is torch.float32
++            and query.dtype is not torch.float32
++            and _layercast_keep_fp32_rope_cache()
++        ):
++            return cos_sin_cache.to(query.device, dtype=query.dtype)
++
+         cos_sin_cache = cos_sin_cache.to(query.device, dtype=query.dtype)
+         # Avoid mutating buffers during torch.compile (cudagraph) tracing.
+         if torch.compiler.is_compiling():
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index daaa86bed..f10b87b8c 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -28,6 +28,15 @@ from vllm.platforms import current_platform
+ DEFAULT_VOCAB_PADDING_SIZE = 64
+
+
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+     """Unquantized method for embeddings."""
+
+@@ -66,9 +75,16 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if _layercast_enabled() and torch.is_floating_point(x):
++            weight = layer.weight
++            if torch.is_floating_point(weight):
++                bias = None if bias is None else bias.to(torch.float32)
++                return F.linear(x.to(torch.float32), weight.to(torch.float32), bias)
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
++        if _layercast_enabled() and torch.is_floating_point(layer.weight):
++            return F.embedding(input_, layer.weight.to(torch.float32))
+         return F.embedding(input_, layer.weight)
+
+
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index d6c38664f..11d7bcecb 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
++import os
+
+ import torch
+ import torch.nn as nn
+@@ -22,6 +23,36 @@ from vllm.utils.torch_utils import set_default_torch_dtype
+ logger = init_logger(__name__)
+
+
++def _layercast_model_init_dtype(dtype: torch.dtype) -> torch.dtype:
++    enabled = os.environ.get("VLLM_LAYERCAST_FORCE_FP32", "").lower()
++    if enabled in {"1", "true", "yes", "on"} and dtype is torch.float32:
++        return torch.bfloat16
++    return dtype
++
++
++def _restore_layercast_buffer_dtype(model: nn.Module, dtype: torch.dtype) -> None:
++    enabled = os.environ.get("VLLM_LAYERCAST_FORCE_FP32", "").lower()
++    if enabled not in {"1", "true", "yes", "on"}:
++        return
++    for module in model.modules():
++        if isinstance(getattr(module, "dtype", None), torch.dtype):
++            module.dtype = dtype
++        buffer = getattr(module, "cos_sin_cache", None)
++        if (
++            isinstance(buffer, torch.Tensor)
++            and buffer.dtype != dtype
++            and hasattr(module, "_compute_cos_sin_cache")
++        ):
++            cache = module._compute_cos_sin_cache()
++            if not getattr(module, "use_flashinfer", False):
++                cache = cache.to(dtype=dtype)
++            cache = cache.to(device=buffer.device)
++            module._buffers["cos_sin_cache"] = cache
++        for name, buffer in module.named_buffers(recurse=False):
++            if buffer is not None and torch.is_floating_point(buffer):
++                module._buffers[name] = buffer.to(dtype=dtype)
++
++
+ class BaseModelLoader(ABC):
+     """Base class for model loaders."""
+
+@@ -50,13 +81,15 @@ class BaseModelLoader(ABC):
+             device_config.device if load_config.device is None else load_config.device
+         )
+         target_device = torch.device(load_device)
+-        with set_default_torch_dtype(model_config.dtype):
++        init_dtype = _layercast_model_init_dtype(model_config.dtype)
++        with set_default_torch_dtype(init_dtype):
+             with target_device:
+                 model = initialize_model(
+                     vllm_config=vllm_config,
+                     model_config=model_config,
+                     prefix=prefix,
+                 )
++            _restore_layercast_buffer_dtype(model, model_config.dtype)
+
+             log_model_inspection(model)
+
+diff --git a/vllm/model_executor/models/layercast_runtime.py b/vllm/model_executor/models/layercast_runtime.py
+new file mode 100644
+index 000000000..b4ae3b633
+--- /dev/null
++++ b/vllm/model_executor/models/layercast_runtime.py
+@@ -0,0 +1,40 @@
++# SPDX-License-Identifier: Apache-2.0
++"""LayerCast runtime gates for local experiments.
++
++This patch does not provide rounding or analyzer helpers. Detailed tensor dumps
++belong to the dedicated analyzer patches.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++
++def _env_enabled(name: str) -> bool:
++    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
++
++
++def _configure_float32_matmul_precision() -> None:
++    raw_precision = os.environ.get("VLLM_FLOAT32_MATMUL_PRECISION")
++    raw_tf32 = os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE")
++    if raw_precision:
++        try:
++            torch.set_float32_matmul_precision(raw_precision)
++        except Exception:
++            pass
++    if raw_tf32 is not None:
++        try:
++            allow_tf32 = raw_tf32.lower() in {"1", "true", "yes", "on"}
++            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
++            torch.backends.cudnn.allow_tf32 = allow_tf32
++        except Exception:
++            pass
++
++
++_configure_float32_matmul_precision()
++
++
++def layercast_enabled() -> bool:
++    return _env_enabled("VLLM_LAYERCAST_FORCE_FP32")
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 2ecced3df..126aa52fd 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -76,6 +76,7 @@ from .utils import (
+     make_layers,
+     maybe_prefix,
+ )
++from .tensor_trace import record_tensor_trace_tensor as _trace_tensor
+
+
+ class LlamaMLP(nn.Module):
+@@ -433,6 +434,7 @@ class LlamaModel(nn.Module, EagleModelMixin):
+             )
+
+         hidden_states, _ = self.norm(hidden_states, residual)
++        hidden_states = _trace_tensor("forward.norm.hidden", hidden_states)
+
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 27aa6175b..5c751270c 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -78,6 +78,7 @@ from .utils import (
+     make_layers,
+     maybe_prefix,
+ )
++from .tensor_trace import record_tensor_trace_tensor as _trace_tensor
+
+
+ class Qwen2MLP(nn.Module):
+@@ -452,6 +453,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+             )
+
+         hidden_states, _ = self.norm(hidden_states, residual)
++        hidden_states = _trace_tensor("forward.norm.hidden", hidden_states)
+
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+diff --git a/vllm/model_executor/models/tensor_trace.py b/vllm/model_executor/models/tensor_trace.py
+new file mode 100644
+index 000000000..132b53496
+--- /dev/null
++++ b/vllm/model_executor/models/tensor_trace.py
+@@ -0,0 +1,141 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Small env-gated tensor tracing hooks for local precision benchmarks."""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++from pathlib import Path
++from typing import Any
++
++import torch
++from safetensors.torch import save_file
++
++_TENSORS: dict[str, list[torch.Tensor]] = {}
++_TENSOR_METADATA: dict[str, list[dict[str, object]]] = {}
++_ROW_METADATA: dict[str, object] | None = None
++_ROW_METADATA_LIST_KEYS = {
++    "row_request_indices",
++    "row_token_positions",
++    "row_token_ids",
++}
++
++
++def _tensor_file() -> str:
++    return os.environ.get("TENSOR_TRACE_TENSOR_FILE") or os.environ.get(
++        "VLLM_TENSOR_TRACE_TENSOR_FILE", ""
++    )
++
++
++def tensor_trace_enabled() -> bool:
++    return bool(_tensor_file())
++
++
++def _stage_enabled(stage: str) -> bool:
++    pattern = os.environ.get("TENSOR_TRACE_STAGE_REGEX") or os.environ.get(
++        "VLLM_TENSOR_TRACE_STAGE_REGEX", ""
++    )
++    if not pattern:
++        return True
++    return re.search(pattern, stage) is not None
++
++
++def set_tensor_trace_row_metadata(metadata: dict[str, Any] | None) -> None:
++    global _ROW_METADATA
++    _ROW_METADATA = dict(metadata) if metadata is not None else None
++
++
++def clear_tensor_trace_row_metadata() -> None:
++    global _ROW_METADATA
++    _ROW_METADATA = None
++
++
++def clear_tensor_trace_tensors() -> None:
++    _TENSORS.clear()
++    _TENSOR_METADATA.clear()
++    clear_tensor_trace_row_metadata()
++
++
++def _row_metadata_for_tensor(row_count: int) -> dict[str, object] | None:
++    if _ROW_METADATA is None:
++        return None
++    metadata: dict[str, object] = {}
++    for key, value in _ROW_METADATA.items():
++        if key not in _ROW_METADATA_LIST_KEYS:
++            metadata[key] = value
++            continue
++        if not isinstance(value, list):
++            metadata[key] = value
++            continue
++        metadata[key] = value[:row_count]
++        if len(value) < row_count:
++            metadata.setdefault("metadata_row_mismatches", []).append(
++                {
++                    "key": key,
++                    "available_rows": len(value),
++                    "tensor_rows": row_count,
++                }
++            )
++    metadata["row_count"] = int(row_count)
++    return metadata
++
++
++def record_tensor_trace_tensor(stage: str, tensor: torch.Tensor) -> torch.Tensor:
++    if not tensor_trace_enabled() or not _stage_enabled(stage):
++        return tensor
++    if not torch.is_tensor(tensor):
++        return tensor
++    with torch.no_grad():
++        captured = tensor.detach()
++        if torch.is_floating_point(captured):
++            captured = captured.to(torch.float32)
++        captured = captured.cpu().contiguous().clone()
++    _TENSORS.setdefault(stage, []).append(captured)
++    if captured.ndim >= 1:
++        row_metadata = _row_metadata_for_tensor(int(captured.shape[0]))
++        if row_metadata is not None:
++            _TENSOR_METADATA.setdefault(stage, []).append(row_metadata)
++    return tensor
++
++
++def _payload_and_metadata() -> tuple[dict[str, torch.Tensor], dict[str, object]]:
++    payload: dict[str, torch.Tensor] = {}
++    metadata: dict[str, object] = {}
++    for stage, chunks in _TENSORS.items():
++        stage_rows = []
++        stage_row_metadata = _TENSOR_METADATA.get(stage, [])
++        for idx, tensor in enumerate(chunks):
++            key = f"{stage}__chunk_{idx:06d}" if len(chunks) > 1 else stage
++            payload[key] = tensor
++            row = {
++                "key": key,
++                "shape": list(tensor.shape),
++                "dtype": str(tensor.dtype),
++            }
++            if idx < len(stage_row_metadata):
++                row["row_metadata"] = stage_row_metadata[idx]
++            stage_rows.append(row)
++        metadata[stage] = stage_rows
++    return payload, metadata
++
++
++def flush_tensor_trace_tensors(
++    tensor_file: str | os.PathLike[str] | None = None,
++    *,
++    clear: bool = True,
++) -> None:
++    target = str(tensor_file) if tensor_file is not None else _tensor_file()
++    if not target:
++        return
++    payload, metadata = _payload_and_metadata()
++    if payload:
++        path = Path(target)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        save_file(payload, str(path))
++        path.with_suffix(path.suffix + ".meta.json").write_text(
++            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
++            encoding="utf-8",
++        )
++    if clear:
++        clear_tensor_trace_tensors()
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index ca5d0e336..611d0ddb5 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -105,6 +105,7 @@ def kernel_unified_attention_2d(
+     num_seqs: tl.int32,
+     BLOCK_M: tl.constexpr,  # int
+     USE_FP8: tl.constexpr,  # bool
++    FP32_DOT_INPUT_PRECISION: tl.constexpr,  # str
+     FP8_MIN: tl.constexpr = float8_info.min,
+     FP8_MAX: tl.constexpr = float8_info.max,
+ ):
+@@ -265,7 +266,7 @@ def kernel_unified_attention_2d(
+             else:
+                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+         else:
+-            K = K_load
++            K = K_load.to(Q.dtype)
+
+         # V : (TILE_SIZE, HEAD_SIZE)
+         V_load = tl.load(
+@@ -280,7 +281,7 @@ def kernel_unified_attention_2d(
+             else:
+                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+         else:
+-            V = V_load
++            V = V_load.to(Q.dtype)
+
+         # Compute attention mask: causal by default (key <= query)
+         query_abs_pos = context_len + query_pos[:, None]
+@@ -318,7 +319,7 @@ def kernel_unified_attention_2d(
+         # S : (BLOCK_M, TILE_SIZE)
+         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+
+-        S += scale * tl.dot(Q, K)
++        S += scale * tl.dot(Q, K, input_precision=FP32_DOT_INPUT_PRECISION)
+
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -382,7 +383,7 @@ def kernel_unified_attention_2d(
+             )
+
+         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+-        acc += tl.dot(P.to(V.dtype), V)
++        acc += tl.dot(P.to(V.dtype), V, input_precision=FP32_DOT_INPUT_PRECISION)
+
+     # epilogue
+     acc = acc / L[:, None]
+@@ -450,6 +451,7 @@ def kernel_unified_attention_3d(
+     num_seqs: tl.int32,
+     BLOCK_M: tl.constexpr,  # int
+     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
++    FP32_DOT_INPUT_PRECISION: tl.constexpr,  # str
+     USE_MM_PREFIX: tl.constexpr,  # bool
+     MAX_MM_RANGES: tl.constexpr,  # int
+     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
+@@ -620,7 +622,7 @@ def kernel_unified_attention_3d(
+             else:
+                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+         else:
+-            K = K_load
++            K = K_load.to(Q.dtype)
+
+         # V : (TILE_SIZE, HEAD_SIZE)
+         V_load = tl.load(
+@@ -635,7 +637,7 @@ def kernel_unified_attention_3d(
+             else:
+                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+         else:
+-            V = V_load
++            V = V_load.to(Q.dtype)
+
+         # Compute attention mask: causal by default (key <= query)
+         query_abs_pos = context_len + query_pos[:, None]
+@@ -672,7 +674,7 @@ def kernel_unified_attention_3d(
+
+         # S : (BLOCK_M, TILE_SIZE)
+         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+-        S += scale * tl.dot(Q, K)
++        S += scale * tl.dot(Q, K, input_precision=FP32_DOT_INPUT_PRECISION)
+
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -736,7 +738,7 @@ def kernel_unified_attention_3d(
+             )
+
+         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+-        acc += tl.dot(P.to(V.dtype), V)
++        acc += tl.dot(P.to(V.dtype), V, input_precision=FP32_DOT_INPUT_PRECISION)
+
+     segm_output_offset = (
+         query_offset_0[:, None].to(tl.int64)
+@@ -970,6 +972,9 @@ def unified_attention(
+         q.element_size(),
+         is_prefill=False,
+     )
++    fp32_dot_input_precision = (
++        "ieee" if envs.VLLM_FLOAT32_MATMUL_PRECISION == "highest" else "tf32"
++    )
+
+     # Launch the 2D kernel if
+     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
+@@ -1040,6 +1045,7 @@ def unified_attention(
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             USE_FP8=output_scale is not None,
++            FP32_DOT_INPUT_PRECISION=fp32_dot_input_precision,
+         )
+     else:
+         kernel_unified_attention_3d[
+@@ -1092,6 +1098,7 @@ def unified_attention(
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
++            FP32_DOT_INPUT_PRECISION=fp32_dot_input_precision,
+         )
+         reduce_segments[(q.shape[0], num_query_heads)](
+             output_ptr=out,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 2e62206da..7eed3892b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -3488,6 +3488,71 @@ class GPUModelRunner(
+         finally:
+             self.prepare_inputs_event.record()
+
++    def _set_tensor_trace_row_metadata(
++        self,
++        *,
++        num_reqs: int,
++        num_tokens_unpadded: int,
++        num_tokens_padded: int,
++        num_scheduled_tokens_np: np.ndarray,
++    ) -> None:
++        try:
++            from vllm.model_executor.models.tensor_trace import (
++                clear_tensor_trace_row_metadata,
++                set_tensor_trace_row_metadata,
++                tensor_trace_enabled,
++            )
++        except (ImportError, AttributeError):
++            return
++
++        if not tensor_trace_enabled():
++            return
++        if num_tokens_unpadded <= 0:
++            clear_tensor_trace_row_metadata()
++            return
++
++        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens_np)
++        token_offsets = self.query_pos.np[:num_tokens_unpadded]
++        token_positions = (
++            self.input_batch.num_computed_tokens_cpu[req_indices] + token_offsets
++        )
++
++        row_request_indices = req_indices.astype(np.int32, copy=False).tolist()
++        row_token_positions = token_positions.astype(np.int64, copy=False).tolist()
++        row_token_ids = [
++            int(token_id)
++            for token_id in self.input_ids.cpu[:num_tokens_unpadded].tolist()
++        ]
++
++        if num_tokens_padded > num_tokens_unpadded:
++            padding = num_tokens_padded - num_tokens_unpadded
++            row_request_indices.extend([-1] * padding)
++            row_token_positions.extend([-1] * padding)
++            row_token_ids.extend([-1] * padding)
++
++        set_tensor_trace_row_metadata(
++            {
++                "request_ids": [
++                    str(req_id) for req_id in self.input_batch.req_ids[:num_reqs]
++                ],
++                "row_request_indices": row_request_indices,
++                "row_token_positions": row_token_positions,
++                "row_token_ids": row_token_ids,
++                "unpadded_rows": int(num_tokens_unpadded),
++                "padded_rows": int(num_tokens_padded),
++            }
++        )
++
++    @staticmethod
++    def _clear_tensor_trace_row_metadata() -> None:
++        try:
++            from vllm.model_executor.models.tensor_trace import (
++                clear_tensor_trace_row_metadata,
++            )
++        except (ImportError, AttributeError):
++            return
++        clear_tensor_trace_row_metadata()
++
+     def _model_forward(
+         self,
+         input_ids: torch.Tensor | None = None,
+@@ -4013,31 +4078,40 @@ class GPUModelRunner(
+         # When spec decode is enabled, defer connector finalization
+         # (wait_for_save + clear metadata) until after draft model runs.
+         defer_kv_connector_finalize = self.speculative_config is not None
+-        with (
+-            set_forward_context(
+-                attn_metadata,
+-                self.vllm_config,
+-                num_tokens=num_tokens_padded,
+-                num_tokens_across_dp=num_tokens_across_dp,
+-                cudagraph_runtime_mode=cudagraph_mode,
+-                batch_descriptor=batch_desc,
+-                ubatch_slices=ubatch_slices_padded,
+-                slot_mapping=slot_mappings,
+-                skip_compiled=has_encoder_input,
+-            ),
+-            record_function_or_nullcontext("gpu_model_runner: forward"),
+-            self.maybe_get_kv_connector_output(
+-                scheduler_output,
+-                defer_finalize=defer_kv_connector_finalize,
+-            ) as kv_connector_output,
+-        ):
+-            model_output = self._model_forward(
+-                input_ids=input_ids,
+-                positions=positions,
+-                intermediate_tensors=intermediate_tensors,
+-                inputs_embeds=inputs_embeds,
+-                **model_kwargs,
+-            )
++        self._set_tensor_trace_row_metadata(
++            num_reqs=num_reqs,
++            num_tokens_unpadded=num_tokens_unpadded,
++            num_tokens_padded=num_tokens_padded,
++            num_scheduled_tokens_np=num_scheduled_tokens_np,
++        )
++        try:
++            with (
++                set_forward_context(
++                    attn_metadata,
++                    self.vllm_config,
++                    num_tokens=num_tokens_padded,
++                    num_tokens_across_dp=num_tokens_across_dp,
++                    cudagraph_runtime_mode=cudagraph_mode,
++                    batch_descriptor=batch_desc,
++                    ubatch_slices=ubatch_slices_padded,
++                    slot_mapping=slot_mappings,
++                    skip_compiled=has_encoder_input,
++                ),
++                record_function_or_nullcontext("gpu_model_runner: forward"),
++                self.maybe_get_kv_connector_output(
++                    scheduler_output,
++                    defer_finalize=defer_kv_connector_finalize,
++                ) as kv_connector_output,
++            ):
++                model_output = self._model_forward(
++                    input_ids=input_ids,
++                    positions=positions,
++                    intermediate_tensors=intermediate_tensors,
++                    inputs_embeds=inputs_embeds,
++                    **model_kwargs,
++                )
++        finally:
++            self._clear_tensor_trace_row_metadata()
+
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:

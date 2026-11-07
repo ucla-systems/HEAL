@@ -1,0 +1,5083 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cf59f18eb..aa2f78039 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -22,6 +22,8 @@ set(VLLM_TARGET_DEVICE "cuda" CACHE STRING "Target device backend for vLLM")
+ message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+ message(STATUS "Target device: ${VLLM_TARGET_DEVICE}")
+ 
++set(VLLM_EXT_LIBRARIES)
++
+ include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
+ 
+ # Suppress potential warnings about unused manually-specified variables
+@@ -343,7 +345,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
+     "csrc/quantization/w8a8/cutlass/scaled_mm_entry.cu"
+     "csrc/quantization/fp4/nvfp4_quant_entry.cu"
+     "csrc/quantization/fp4/nvfp4_scaled_mm_entry.cu"
+-    "csrc/cutlass_extensions/common.cpp")
++    "csrc/cutlass_extensions/common.cpp"
++    "csrc/heal_blaslt_gemm.cu")
++  list(APPEND VLLM_EXT_LIBRARIES CUDA::cublasLt)
+ 
+   set_gencode_flags_for_srcs(
+     SRCS "${VLLM_EXT_SRC}"
+@@ -934,7 +938,10 @@ if (VLLM_GPU_LANG STREQUAL "HIP")
+   # Add QuickReduce kernels
+   list(APPEND VLLM_EXT_SRC
+     "csrc/custom_quickreduce.cu"
++    "csrc/heal_blaslt_gemm.cu"
+   )
++  find_package(hipblaslt REQUIRED CONFIG)
++  list(APPEND VLLM_EXT_LIBRARIES roc::hipblaslt)
+ # if ROCM endif
+ endif()
+ 
+@@ -948,6 +955,7 @@ define_extension_target(
+   ARCHITECTURES ${VLLM_GPU_ARCHES}
+   INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}
+   INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
++  LIBRARIES ${VLLM_EXT_LIBRARIES}
+   USE_SABI 3
+   WITH_SOABI)
+ 
+diff --git a/csrc/heal_blaslt_gemm.cu b/csrc/heal_blaslt_gemm.cu
+new file mode 100644
+index 000000000..df491b2c6
+--- /dev/null
++++ b/csrc/heal_blaslt_gemm.cu
+@@ -0,0 +1,298 @@
++// SPDX-License-Identifier: Apache-2.0
++// FP16/BF16 input GEMM with FP32 accumulation and FP32 output via BLASLt.
++
++#include <ATen/cuda/CUDAContext.h>
++#include <c10/cuda/CUDAGuard.h>
++#ifdef USE_ROCM
++#include <hipblaslt/hipblaslt.h>
++#else
++#include <cublasLt.h>
++#endif
++#include <torch/all.h>
++
++#include <limits>
++#include <mutex>
++#include <tuple>
++#include <unordered_map>
++
++namespace {
++
++#ifdef USE_ROCM
++using BlasltDataType = hipDataType;
++using BlasltEpilogue = hipblasLtEpilogue_t;
++using BlasltHandle = hipblasLtHandle_t;
++using BlasltMatrixLayout = hipblasLtMatrixLayout_t;
++using BlasltMatmulAlgo = hipblasLtMatmulAlgo_t;
++using BlasltMatmulDesc = hipblasLtMatmulDesc_t;
++using BlasltMatmulHeuristicResult = hipblasLtMatmulHeuristicResult_t;
++using BlasltMatmulPreference = hipblasLtMatmulPreference_t;
++using BlasltOperation = hipblasOperation_t;
++constexpr auto kBlasltCompute32F = HIPBLAS_COMPUTE_32F;
++constexpr auto kBlasltData16BF = HIP_R_16BF;
++constexpr auto kBlasltData16F = HIP_R_16F;
++constexpr auto kBlasltData32F = HIP_R_32F;
++constexpr auto kBlasltEpilogueBias = HIPBLASLT_EPILOGUE_BIAS;
++constexpr auto kBlasltOpN = HIPBLAS_OP_N;
++constexpr auto kBlasltOpT = HIPBLAS_OP_T;
++constexpr auto kBlasltPrefMaxWorkspaceBytes =
++    HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES;
++constexpr auto kBlasltStatusSuccess = HIPBLAS_STATUS_SUCCESS;
++#define HEAL_BLASLT_CREATE hipblasLtCreate
++#define HEAL_BLASLT_MATRIX_LAYOUT_CREATE hipblasLtMatrixLayoutCreate
++#define HEAL_BLASLT_MATRIX_LAYOUT_DESTROY hipblasLtMatrixLayoutDestroy
++#define HEAL_BLASLT_MATMUL hipblasLtMatmul
++#define HEAL_BLASLT_MATMUL_ALGO_GET_HEURISTIC hipblasLtMatmulAlgoGetHeuristic
++#define HEAL_BLASLT_MATMUL_DESC_CREATE hipblasLtMatmulDescCreate
++#define HEAL_BLASLT_MATMUL_DESC_DESTROY hipblasLtMatmulDescDestroy
++#define HEAL_BLASLT_MATMUL_DESC_SET_ATTRIBUTE hipblasLtMatmulDescSetAttribute
++#define HEAL_BLASLT_MATMUL_PREF_CREATE hipblasLtMatmulPreferenceCreate
++#define HEAL_BLASLT_MATMUL_PREF_DESTROY hipblasLtMatmulPreferenceDestroy
++#define HEAL_BLASLT_MATMUL_PREF_SET_ATTRIBUTE hipblasLtMatmulPreferenceSetAttribute
++#define HEAL_BLASLT_MATMUL_DESC_BIAS_POINTER HIPBLASLT_MATMUL_DESC_BIAS_POINTER
++#define HEAL_BLASLT_MATMUL_DESC_EPILOGUE HIPBLASLT_MATMUL_DESC_EPILOGUE
++#define HEAL_BLASLT_MATMUL_DESC_TRANSA HIPBLASLT_MATMUL_DESC_TRANSA
++#define HEAL_BLASLT_MATMUL_DESC_TRANSB HIPBLASLT_MATMUL_DESC_TRANSB
++#else
++using BlasltDataType = cudaDataType_t;
++using BlasltEpilogue = cublasLtEpilogue_t;
++using BlasltHandle = cublasLtHandle_t;
++using BlasltMatrixLayout = cublasLtMatrixLayout_t;
++using BlasltMatmulAlgo = cublasLtMatmulAlgo_t;
++using BlasltMatmulDesc = cublasLtMatmulDesc_t;
++using BlasltMatmulHeuristicResult = cublasLtMatmulHeuristicResult_t;
++using BlasltMatmulPreference = cublasLtMatmulPreference_t;
++using BlasltOperation = cublasOperation_t;
++constexpr auto kBlasltCompute32F = CUBLAS_COMPUTE_32F;
++constexpr auto kBlasltData16BF = CUDA_R_16BF;
++constexpr auto kBlasltData16F = CUDA_R_16F;
++constexpr auto kBlasltData32F = CUDA_R_32F;
++constexpr auto kBlasltEpilogueBias = CUBLASLT_EPILOGUE_BIAS;
++constexpr auto kBlasltOpN = CUBLAS_OP_N;
++constexpr auto kBlasltOpT = CUBLAS_OP_T;
++constexpr auto kBlasltPrefMaxWorkspaceBytes =
++    CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES;
++constexpr auto kBlasltStatusSuccess = CUBLAS_STATUS_SUCCESS;
++#define HEAL_BLASLT_CREATE cublasLtCreate
++#define HEAL_BLASLT_MATRIX_LAYOUT_CREATE cublasLtMatrixLayoutCreate
++#define HEAL_BLASLT_MATRIX_LAYOUT_DESTROY cublasLtMatrixLayoutDestroy
++#define HEAL_BLASLT_MATMUL cublasLtMatmul
++#define HEAL_BLASLT_MATMUL_ALGO_GET_HEURISTIC cublasLtMatmulAlgoGetHeuristic
++#define HEAL_BLASLT_MATMUL_DESC_CREATE cublasLtMatmulDescCreate
++#define HEAL_BLASLT_MATMUL_DESC_DESTROY cublasLtMatmulDescDestroy
++#define HEAL_BLASLT_MATMUL_DESC_SET_ATTRIBUTE cublasLtMatmulDescSetAttribute
++#define HEAL_BLASLT_MATMUL_PREF_CREATE cublasLtMatmulPreferenceCreate
++#define HEAL_BLASLT_MATMUL_PREF_DESTROY cublasLtMatmulPreferenceDestroy
++#define HEAL_BLASLT_MATMUL_PREF_SET_ATTRIBUTE cublasLtMatmulPreferenceSetAttribute
++#define HEAL_BLASLT_MATMUL_DESC_BIAS_POINTER CUBLASLT_MATMUL_DESC_BIAS_POINTER
++#define HEAL_BLASLT_MATMUL_DESC_EPILOGUE CUBLASLT_MATMUL_DESC_EPILOGUE
++#define HEAL_BLASLT_MATMUL_DESC_TRANSA CUBLASLT_MATMUL_DESC_TRANSA
++#define HEAL_BLASLT_MATMUL_DESC_TRANSB CUBLASLT_MATMUL_DESC_TRANSB
++#endif
++
++constexpr size_t kMaxWorkspaceBytes = 0;
++
++struct AlgoKey {
++  int device;
++  int64_t m;
++  int64_t n;
++  int64_t k;
++  int dtype;
++  bool has_bias;
++
++  bool operator==(const AlgoKey& other) const {
++    return device == other.device && m == other.m && n == other.n &&
++           k == other.k && dtype == other.dtype && has_bias == other.has_bias;
++  }
++};
++
++struct AlgoKeyHash {
++  size_t operator()(const AlgoKey& key) const {
++    size_t h = std::hash<int>{}(key.device);
++    auto mix = [&h](auto value) {
++      using Value = std::decay_t<decltype(value)>;
++      h ^= std::hash<Value>{}(value) + 0x9e3779b97f4a7c15ULL +
++           (h << 6) + (h >> 2);
++    };
++    mix(key.m);
++    mix(key.n);
++    mix(key.k);
++    mix(key.dtype);
++    mix(key.has_bias);
++    return h;
++  }
++};
++
++std::mutex g_algo_cache_mutex;
++std::unordered_map<AlgoKey, BlasltMatmulAlgo, AlgoKeyHash> g_algo_cache;
++
++BlasltHandle get_blaslt_handle() {
++  static BlasltHandle handle = [] {
++    BlasltHandle h;
++    TORCH_CUDABLAS_CHECK(HEAL_BLASLT_CREATE(&h));
++    return h;
++  }();
++  return handle;
++}
++
++BlasltDataType blaslt_type_for_tensor(const torch::Tensor& tensor) {
++  if (tensor.dtype() == torch::kFloat16) {
++    return kBlasltData16F;
++  }
++  if (tensor.dtype() == torch::kBFloat16) {
++    return kBlasltData16BF;
++  }
++  TORCH_CHECK(false,
++              "blaslt_fp32_output_gemm: expected float16 or bfloat16 input, "
++              "got ",
++              tensor.dtype());
++}
++
++BlasltMatrixLayout make_column_major_layout(BlasltDataType type,
++                                                int64_t rows, int64_t cols,
++                                                int64_t ld) {
++  BlasltMatrixLayout layout;
++  TORCH_CUDABLAS_CHECK(
++      HEAL_BLASLT_MATRIX_LAYOUT_CREATE(&layout, type, rows, cols, ld));
++  return layout;
++}
++
++BlasltMatmulAlgo get_heuristic_algo(BlasltHandle handle,
++                                        BlasltMatmulDesc matmul_desc,
++                                        BlasltMatrixLayout a_desc,
++                                        BlasltMatrixLayout b_desc,
++                                        BlasltMatrixLayout c_desc,
++                                        BlasltMatrixLayout d_desc,
++                                        const AlgoKey& key) {
++  {
++    std::lock_guard<std::mutex> lock(g_algo_cache_mutex);
++    auto it = g_algo_cache.find(key);
++    if (it != g_algo_cache.end()) {
++      return it->second;
++    }
++  }
++
++  BlasltMatmulPreference preference;
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATMUL_PREF_CREATE(&preference));
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATMUL_PREF_SET_ATTRIBUTE(
++      preference, kBlasltPrefMaxWorkspaceBytes,
++      &kMaxWorkspaceBytes, sizeof(kMaxWorkspaceBytes)));
++
++  BlasltMatmulHeuristicResult result;
++  int returned_results = 0;
++  auto status = HEAL_BLASLT_MATMUL_ALGO_GET_HEURISTIC(
++      handle, matmul_desc, a_desc, b_desc, c_desc, d_desc, preference, 1,
++      &result, &returned_results);
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATMUL_PREF_DESTROY(preference));
++  TORCH_CUDABLAS_CHECK(status);
++  TORCH_CHECK(returned_results > 0 && result.state == kBlasltStatusSuccess,
++              "blaslt_fp32_output_gemm: BLASLt found no supported "
++              "algorithm for this GEMM shape");
++  TORCH_CHECK(result.workspaceSize == 0,
++              "blaslt_fp32_output_gemm: expected zero-workspace algorithm, "
++              "got workspaceSize=",
++              result.workspaceSize);
++
++  {
++    std::lock_guard<std::mutex> lock(g_algo_cache_mutex);
++    g_algo_cache.emplace(key, result.algo);
++  }
++  return result.algo;
++}
++
++}  // namespace
++
++void blaslt_fp32_output_gemm(torch::Tensor& out, torch::Tensor const& a,
++                               torch::Tensor const& b,
++                               std::optional<torch::Tensor> const& bias) {
++  TORCH_CHECK(a.is_cuda() && b.is_cuda() && out.is_cuda(),
++              "blaslt_fp32_output_gemm: all tensors must be CUDA tensors");
++  TORCH_CHECK(a.dim() == 2 && b.dim() == 2 && out.dim() == 2,
++              "blaslt_fp32_output_gemm: expected 2-D tensors");
++  TORCH_CHECK(a.dtype() == b.dtype(),
++              "blaslt_fp32_output_gemm: input and weight dtypes must match");
++  TORCH_CHECK(a.dtype() == torch::kFloat16 || a.dtype() == torch::kBFloat16,
++              "blaslt_fp32_output_gemm: expected float16 or bfloat16 inputs");
++  TORCH_CHECK(out.dtype() == torch::kFloat32,
++              "blaslt_fp32_output_gemm: output must be float32");
++  TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && out.is_contiguous(),
++              "blaslt_fp32_output_gemm: tensors must be contiguous");
++  TORCH_CHECK(a.size(1) == b.size(1),
++              "blaslt_fp32_output_gemm: inner dimensions must match");
++  TORCH_CHECK(out.size(0) == a.size(0) && out.size(1) == b.size(0),
++              "blaslt_fp32_output_gemm: output shape must be [M, N]");
++
++  const auto m = a.size(0);
++  const auto k = a.size(1);
++  const auto n = b.size(0);
++
++  if (m == 0 || n == 0) {
++    return;
++  }
++  TORCH_CHECK(m <= std::numeric_limits<int32_t>::max() &&
++                  n <= std::numeric_limits<int32_t>::max() &&
++                  k <= std::numeric_limits<int32_t>::max(),
++              "blaslt_fp32_output_gemm: dimensions exceed int32 range");
++
++  torch::Tensor bias_tensor;
++  void* bias_ptr = nullptr;
++  const bool has_bias = bias.has_value() && bias->defined();
++  if (has_bias) {
++    bias_tensor = bias.value();
++    TORCH_CHECK(bias_tensor.is_cuda() && bias_tensor.dtype() == torch::kFloat32,
++                "blaslt_fp32_output_gemm: bias must be CUDA float32");
++    TORCH_CHECK(bias_tensor.is_contiguous() && bias_tensor.dim() == 1 &&
++                    bias_tensor.numel() == n,
++                "blaslt_fp32_output_gemm: bias must be contiguous [N]");
++    bias_ptr = bias_tensor.data_ptr();
++  }
++
++  const at::cuda::OptionalCUDAGuard device_guard(device_of(a));
++  auto handle = get_blaslt_handle();
++  auto stream = at::cuda::getCurrentCUDAStream();
++  auto ab_type = blaslt_type_for_tensor(a);
++
++  BlasltMatmulDesc matmul_desc;
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATMUL_DESC_CREATE(
++      &matmul_desc, kBlasltCompute32F, kBlasltData32F));
++  // Row-major out = a[M, K] @ b[N, K].T is the same memory as the
++  // column-major D[N, M] = b_col[K, N].T @ a_col[K, M].
++  BlasltOperation trans_a = kBlasltOpT;
++  BlasltOperation trans_b = kBlasltOpN;
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATMUL_DESC_SET_ATTRIBUTE(
++      matmul_desc, HEAL_BLASLT_MATMUL_DESC_TRANSA, &trans_a, sizeof(trans_a)));
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATMUL_DESC_SET_ATTRIBUTE(
++      matmul_desc, HEAL_BLASLT_MATMUL_DESC_TRANSB, &trans_b, sizeof(trans_b)));
++  if (has_bias) {
++    BlasltEpilogue epilogue = kBlasltEpilogueBias;
++    TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATMUL_DESC_SET_ATTRIBUTE(
++        matmul_desc, HEAL_BLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
++        sizeof(epilogue)));
++    TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATMUL_DESC_SET_ATTRIBUTE(
++        matmul_desc, HEAL_BLASLT_MATMUL_DESC_BIAS_POINTER, &bias_ptr,
++        sizeof(bias_ptr)));
++  }
++
++  auto a_desc = make_column_major_layout(ab_type, k, n, k);
++  auto b_desc = make_column_major_layout(ab_type, k, m, k);
++  auto c_desc = make_column_major_layout(kBlasltData32F, n, m, n);
++  auto d_desc = make_column_major_layout(kBlasltData32F, n, m, n);
++
++  const AlgoKey key{a.get_device(), m, n, k, static_cast<int>(a.scalar_type()),
++                    has_bias};
++  auto algo =
++      get_heuristic_algo(handle, matmul_desc, a_desc, b_desc, c_desc, d_desc,
++                         key);
++
++  const float alpha = 1.0f;
++  const float beta = 0.0f;
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATMUL(
++      handle, matmul_desc, &alpha, b.data_ptr(), a_desc, a.data_ptr(), b_desc,
++      &beta, out.data_ptr(), c_desc, out.data_ptr(), d_desc, &algo, nullptr, 0,
++      stream));
++
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATRIX_LAYOUT_DESTROY(a_desc));
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATRIX_LAYOUT_DESTROY(b_desc));
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATRIX_LAYOUT_DESTROY(c_desc));
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATRIX_LAYOUT_DESTROY(d_desc));
++  TORCH_CUDABLAS_CHECK(HEAL_BLASLT_MATMUL_DESC_DESTROY(matmul_desc));
++}
+diff --git a/csrc/layernorm_kernels.cu b/csrc/layernorm_kernels.cu
+index 9766103f7..5cdc30d4a 100644
+--- a/csrc/layernorm_kernels.cu
++++ b/csrc/layernorm_kernels.cu
+@@ -179,6 +179,91 @@ fused_add_rms_norm_kernel(
+   }
+ }
+ 
++
++template <typename weight_t, int NUM_DIMS>
++__global__ void heal_rms_norm_fp32_kernel(
++    float* __restrict__ out,          // [..., hidden_size]
++    const float* __restrict__ input,  // [..., hidden_size]
++    const int64_t input_stride_d2,    // input.stride(-2)
++    const int64_t input_stride_d3,    // input.stride(-3)
++    const int64_t input_stride_d4,    // input.stride(-4)
++    const int64_t input_shape_d2,     // input.size(-2)
++    const int64_t input_shape_d3,     // input.size(-3)
++    const weight_t* __restrict__ weight,  // [hidden_size]
++    const float epsilon, const int num_tokens, const int hidden_size) {
++  __shared__ float s_variance;
++  float variance = 0.0f;
++  const float* input_row = nullptr;
++  if constexpr (NUM_DIMS == 2) {
++    input_row = input + blockIdx.x * input_stride_d2;
++  } else if constexpr (NUM_DIMS == 3) {
++    int batch_idx = blockIdx.x / input_shape_d2;
++    int head_idx = blockIdx.x % input_shape_d2;
++    input_row =
++        input + batch_idx * input_stride_d3 + head_idx * input_stride_d2;
++  } else if constexpr (NUM_DIMS == 4) {
++    int batch_idx = blockIdx.x / (input_shape_d3 * input_shape_d2);
++    int remaining = blockIdx.x % (input_shape_d3 * input_shape_d2);
++    int seq_idx = remaining / input_shape_d2;
++    int head_idx = remaining % input_shape_d2;
++    input_row = input + batch_idx * input_stride_d4 +
++                seq_idx * input_stride_d3 + head_idx * input_stride_d2;
++  }
++
++  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
++    float x = input_row[idx];
++    variance += x * x;
++  }
++
++  using BlockReduce = cub::BlockReduce<float, 1024>;
++  __shared__ typename BlockReduce::TempStorage reduceStore;
++  variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
++
++  if (threadIdx.x == 0) {
++    s_variance = rsqrtf(variance / hidden_size + epsilon);
++  }
++  __syncthreads();
++
++  float* out_row = out + blockIdx.x * hidden_size;
++  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
++    float weight_fp32 = static_cast<float>(weight[idx]);
++    out_row[idx] = input_row[idx] * s_variance * weight_fp32;
++  }
++}
++
++template <typename weight_t>
++__global__ void heal_fused_add_rms_norm_fp32_kernel(
++    float* __restrict__ input,  // [..., hidden_size]
++    const int64_t input_stride,
++    float* __restrict__ residual,         // [..., hidden_size]
++    const weight_t* __restrict__ weight,  // [hidden_size]
++    const float epsilon, const int num_tokens, const int hidden_size) {
++  __shared__ float s_variance;
++  float variance = 0.0f;
++
++  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
++    float z = input[blockIdx.x * input_stride + idx] +
++              residual[blockIdx.x * hidden_size + idx];
++    variance += z * z;
++    residual[blockIdx.x * hidden_size + idx] = z;
++  }
++
++  using BlockReduce = cub::BlockReduce<float, 1024>;
++  __shared__ typename BlockReduce::TempStorage reduceStore;
++  variance = BlockReduce(reduceStore).Reduce(variance, CubAddOp{}, blockDim.x);
++
++  if (threadIdx.x == 0) {
++    s_variance = rsqrtf(variance / hidden_size + epsilon);
++  }
++  __syncthreads();
++
++  for (int idx = threadIdx.x; idx < hidden_size; idx += blockDim.x) {
++    float x = residual[blockIdx.x * hidden_size + idx];
++    float weight_fp32 = static_cast<float>(weight[idx]);
++    input[blockIdx.x * input_stride + idx] = x * s_variance * weight_fp32;
++  }
++}
++
+ }  // namespace vllm
+ 
+ void rms_norm(torch::Tensor& out,     // [..., hidden_size]
+@@ -284,3 +369,104 @@ void fused_add_rms_norm(torch::Tensor& input,     // [..., hidden_size]
+     LAUNCH_FUSED_ADD_RMS_NORM(0);
+   }
+ }
++
++void heal_rms_norm_fp32(torch::Tensor& out,     // [..., hidden_size]
++                        torch::Tensor& input,   // [..., hidden_size]
++                        torch::Tensor& weight,  // [hidden_size]
++                        double epsilon) {
++  TORCH_CHECK(out.scalar_type() == at::kFloat,
++              "heal_rms_norm_fp32: output must be float32");
++  TORCH_CHECK(input.scalar_type() == at::kFloat,
++              "heal_rms_norm_fp32: input must be float32");
++  TORCH_CHECK(weight.scalar_type() == at::kFloat ||
++                  weight.scalar_type() == at::kHalf ||
++                  weight.scalar_type() == at::kBFloat16,
++              "heal_rms_norm_fp32: weight must be float32, float16, or "
++              "bfloat16");
++  TORCH_CHECK(out.is_contiguous(),
++              "heal_rms_norm_fp32: output must be contiguous");
++  if (input.stride(-1) != 1) {
++    input = input.contiguous();
++  }
++  TORCH_CHECK(input.stride(-1) == 1,
++              "heal_rms_norm_fp32: input last dimension must be contiguous");
++  TORCH_CHECK(weight.is_contiguous(),
++              "heal_rms_norm_fp32: weight must be contiguous");
++  TORCH_CHECK(out.sizes() == input.sizes(),
++              "heal_rms_norm_fp32: output shape must match input shape");
++
++  int hidden_size = input.size(-1);
++  TORCH_CHECK(weight.numel() == hidden_size,
++              "heal_rms_norm_fp32: weight size must match hidden size");
++
++  int num_tokens = input.numel() / hidden_size;
++  int num_dims = input.dim();
++  int64_t input_stride_d2 = input.stride(-2);
++  int64_t input_stride_d3 = (num_dims >= 3) ? input.stride(-3) : 0;
++  int64_t input_stride_d4 = (num_dims >= 4) ? input.stride(-4) : 0;
++  int64_t input_shape_d2 = (num_dims >= 3) ? input.size(-2) : 0;
++  int64_t input_shape_d3 = (num_dims >= 4) ? input.size(-3) : 0;
++
++  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
++  dim3 grid(num_tokens);
++  dim3 block(std::min(hidden_size, max_block_size));
++  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
++  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++  VLLM_DISPATCH_RANK234(num_dims, [&] {
++    VLLM_DISPATCH_FLOATING_TYPES(
++        weight.scalar_type(), "heal_rms_norm_fp32_kernel", [&] {
++          vllm::heal_rms_norm_fp32_kernel<scalar_t, tensor_rank>
++              <<<grid, block, 0, stream>>>(
++                  out.data_ptr<float>(), input.data_ptr<float>(),
++                  input_stride_d2, input_stride_d3, input_stride_d4,
++                  input_shape_d2, input_shape_d3, weight.data_ptr<scalar_t>(),
++                  epsilon, num_tokens, hidden_size);
++        });
++  });
++}
++
++void heal_fused_add_rms_norm_fp32(torch::Tensor& input,     // [..., hidden_size]
++                                  torch::Tensor& residual,  // [..., hidden_size]
++                                  torch::Tensor& weight,    // [hidden_size]
++                                  double epsilon) {
++  TORCH_CHECK(input.scalar_type() == at::kFloat,
++              "heal_fused_add_rms_norm_fp32: input must be float32");
++  TORCH_CHECK(residual.scalar_type() == at::kFloat,
++              "heal_fused_add_rms_norm_fp32: residual must be float32");
++  TORCH_CHECK(weight.scalar_type() == at::kFloat ||
++                  weight.scalar_type() == at::kHalf ||
++                  weight.scalar_type() == at::kBFloat16,
++              "heal_fused_add_rms_norm_fp32: weight must be float32, "
++              "float16, or bfloat16");
++  TORCH_CHECK(input.stride(-1) == 1,
++              "heal_fused_add_rms_norm_fp32: input last dimension must be "
++              "contiguous");
++  TORCH_CHECK(residual.is_contiguous(),
++              "heal_fused_add_rms_norm_fp32: residual must be contiguous");
++  TORCH_CHECK(weight.is_contiguous(),
++              "heal_fused_add_rms_norm_fp32: weight must be contiguous");
++  TORCH_CHECK(input.sizes() == residual.sizes(),
++              "heal_fused_add_rms_norm_fp32: input and residual shapes must "
++              "match");
++
++  int hidden_size = input.size(-1);
++  TORCH_CHECK(weight.numel() == hidden_size,
++              "heal_fused_add_rms_norm_fp32: weight size must match hidden "
++              "size");
++  int64_t input_stride = input.stride(-2);
++  int num_tokens = input.numel() / hidden_size;
++
++  dim3 grid(num_tokens);
++  const int max_block_size = (num_tokens < 256) ? 1024 : 256;
++  dim3 block(std::min(hidden_size, max_block_size));
++  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
++  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++  VLLM_DISPATCH_FLOATING_TYPES(
++      weight.scalar_type(), "heal_fused_add_rms_norm_fp32_kernel", [&] {
++        vllm::heal_fused_add_rms_norm_fp32_kernel<scalar_t>
++            <<<grid, block, 0, stream>>>(
++                input.data_ptr<float>(), input_stride,
++                residual.data_ptr<float>(), weight.data_ptr<scalar_t>(),
++                epsilon, num_tokens, hidden_size);
++      });
++}
+diff --git a/csrc/ops.h b/csrc/ops.h
+index 2e16ef877..106b1c3ed 100644
+--- a/csrc/ops.h
++++ b/csrc/ops.h
+@@ -92,6 +92,13 @@ void rms_norm(torch::Tensor& out, torch::Tensor& input, torch::Tensor& weight,
+ void fused_add_rms_norm(torch::Tensor& input, torch::Tensor& residual,
+                         torch::Tensor& weight, double epsilon);
+ 
++void heal_rms_norm_fp32(torch::Tensor& out, torch::Tensor& input,
++                        torch::Tensor& weight, double epsilon);
++
++void heal_fused_add_rms_norm_fp32(torch::Tensor& input,
++                                  torch::Tensor& residual,
++                                  torch::Tensor& weight, double epsilon);
++
+ void fused_qk_norm_rope(torch::Tensor& qkv, int64_t num_heads_q,
+                         int64_t num_heads_k, int64_t num_heads_v,
+                         int64_t head_dim, double eps, torch::Tensor& q_weight,
+@@ -225,6 +232,10 @@ torch::Tensor ggml_moe_a8_vec(torch::Tensor X, torch::Tensor W,
+ 
+ int64_t ggml_moe_get_block_size(int64_t type);
+ 
++void blaslt_fp32_output_gemm(torch::Tensor& out, torch::Tensor const& a,
++                               torch::Tensor const& b,
++                               std::optional<torch::Tensor> const& bias);
++
+ #ifndef USE_ROCM
+ 
+ bool cutlass_scaled_mm_supports_fp4(int64_t cuda_device_capability);
+@@ -391,4 +402,4 @@ int64_t qr_max_size();
+ #ifndef USE_ROCM
+ void dsv3_fused_a_gemm(torch::Tensor& output, torch::Tensor const& mat_a,
+                        torch::Tensor const& mat_b);
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index 3bc69c7bb..9aa0c31c3 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -162,6 +162,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+       "float epsilon) -> ()");
+   ops.impl("fused_add_rms_norm", torch::kCUDA, &fused_add_rms_norm);
+ 
++  // HEAL FP32 stream RMSNorm. Input/output stay FP32 while norm weight may
++  // remain FP16/BF16 in memory and is cast inside the CUDA kernel.
++  ops.def(
++      "heal_rms_norm_fp32(Tensor! result, Tensor input, Tensor weight, "
++      "float epsilon) -> ()");
++  ops.impl("heal_rms_norm_fp32", torch::kCUDA, &heal_rms_norm_fp32);
++
++  // HEAL in-place fused Add and RMSNorm for the FP32 stream.
++  ops.def(
++      "heal_fused_add_rms_norm_fp32(Tensor! input, Tensor! residual, "
++      "Tensor weight, float epsilon) -> ()");
++  ops.impl("heal_fused_add_rms_norm_fp32", torch::kCUDA,
++           &heal_fused_add_rms_norm_fp32);
++
+   // Function for fused QK Norm and RoPE
+   ops.def(
+       "fused_qk_norm_rope(Tensor! qkv, int num_heads_q, "
+@@ -408,6 +422,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
+ 
+   ops.def("ggml_moe_get_block_size", &ggml_moe_get_block_size);
+ 
++  ops.def(
++      "blaslt_fp32_output_gemm(Tensor! out, Tensor a,"
++      "                           Tensor b, Tensor? bias) -> ()");
++  ops.impl("blaslt_fp32_output_gemm", torch::kCUDA,
++           &blaslt_fp32_output_gemm);
++
+ #ifndef USE_ROCM
+   // CUTLASS nvfp4 block scaled GEMM
+   ops.def(
+diff --git a/vllm/_custom_ops.py b/vllm/_custom_ops.py
+index 6c9ca07db..3ffea5bf4 100644
+--- a/vllm/_custom_ops.py
++++ b/vllm/_custom_ops.py
+@@ -414,6 +414,18 @@ def fused_add_rms_norm(
+     torch.ops._C.fused_add_rms_norm(input, residual, weight, epsilon)
+ 
+ 
++def heal_rms_norm_fp32(
++    out: torch.Tensor, input: torch.Tensor, weight: torch.Tensor, epsilon: float
++) -> None:
++    torch.ops._C.heal_rms_norm_fp32(out, input, weight, epsilon)
++
++
++def heal_fused_add_rms_norm_fp32(
++    input: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, epsilon: float
++) -> None:
++    torch.ops._C.heal_fused_add_rms_norm_fp32(input, residual, weight, epsilon)
++
++
+ def fused_qk_norm_rope(
+     qkv: torch.Tensor,
+     num_heads_q: int,
+@@ -847,6 +859,29 @@ def cutlass_scaled_mm(
+     return out.view(*target_shape)
+ 
+ 
++def blaslt_fp32_output_gemm(
++    out: torch.Tensor,
++    a: torch.Tensor,
++    b: torch.Tensor,
++    bias: torch.Tensor | None = None,
++) -> None:
++    torch.ops._C.blaslt_fp32_output_gemm(out, a, b, None)
++    if bias is not None:
++        out.add_(bias.to(torch.float32))
++
++
++if hasattr(torch.ops._C, "blaslt_fp32_output_gemm"):
++
++    @register_fake("_C::blaslt_fp32_output_gemm")
++    def _blaslt_fp32_output_gemm_fake(
++        out: torch.Tensor,
++        a: torch.Tensor,
++        b: torch.Tensor,
++        bias: torch.Tensor | None = None,
++    ) -> None:
++        return None
++
++
+ def cutlass_scaled_mm_azp(
+     a: torch.Tensor,
+     b: torch.Tensor,
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index 7610030f3..6bac9e0bf 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -46,6 +46,51 @@ if TYPE_CHECKING:
+ logger = init_logger(__name__)
+ 
+ 
++from vllm.v1.attention.ops.triton_int16_v_cache import triton_quantize_int16_q
++
++
++def _heal_enabled(layer: torch.nn.Module | None = None) -> bool:
++    if layer is not None:
++        cached = getattr(layer, "_heal_enabled", None)
++        if cached is not None:
++            return bool(cached)
++    try:
++        from vllm.model_executor.models.heal_runtime import enabled
++
++        return enabled()
++    except Exception:
++        return False
++
++
++def _heal_fp32_attention_output_enabled(
++    layer: torch.nn.Module | None = None,
++) -> bool:
++    if layer is not None:
++        cached = getattr(layer, "_heal_fp32_attention_output", None)
++        if cached is not None:
++            return bool(cached)
++    try:
++        from vllm.model_executor.models.heal_runtime import fp32_attention_output_enabled
++
++        return fp32_attention_output_enabled()
++    except Exception:
++        return False
++
++
++def _heal_int16_q_input_enabled(layer: torch.nn.Module) -> bool:
++    cached = getattr(layer, "_heal_int16_q_input", None)
++    if cached is not None:
++        return bool(cached)
++    try:
++        from vllm.model_executor.models.heal_runtime import (
++            int16_q_input_enabled_for_layer,
++        )
++
++        return int16_q_input_enabled_for_layer(layer)
++    except Exception:
++        return False
++
++
+ def validate_kv_sharing_target(
+     current_layer_name, target_layer_name, static_forward_context
+ ):
+@@ -277,6 +322,15 @@ class Attention(nn.Module, AttentionLayerBase):
+         )
+         self.quant_config = quant_config
+         self.layer_name = prefix
++        try:
++            from vllm.model_executor.models.heal_runtime import (
++                configure_attention_module,
++            )
++            from vllm.model_executor.models.utils import extract_layer_index
++
++            configure_attention_module(self, extract_layer_index(prefix))
++        except Exception:
++            pass
+ 
+         self.num_heads = num_heads
+         self.head_size = head_size
+@@ -416,7 +470,11 @@ class Attention(nn.Module, AttentionLayerBase):
+         """
+         if self.calculate_kv_scales:
+             torch.ops.vllm.maybe_calc_kv_scales(query, key, value, self.layer_name)
+-        output_dtype = query.dtype
++        output_dtype = (
++            torch.float32
++            if getattr(self, "_heal_fp32_attention_output", False)
++            else query.dtype
++        )
+         if self.query_quant is not None:
+             # quantizing with a simple torch operation enables
+             # torch.compile to fuse this into previous ops
+@@ -448,6 +506,9 @@ class Attention(nn.Module, AttentionLayerBase):
+                 key = key.view(-1, self.num_kv_heads, self.head_size)
+             if value is not None:
+                 value = value.view(-1, self.num_kv_heads, self.head_size_v)
++            q_int16_scale = None
++            if getattr(self, "_heal_int16_q_input", False):
++                query, q_int16_scale = triton_quantize_int16_q(query)
+             kv_cache_dummy_dep = None
+             if self.use_direct_call:
+                 # Skip this if sharing KV cache with an earlier attention layer.
+@@ -466,6 +527,7 @@ class Attention(nn.Module, AttentionLayerBase):
+                     value,
+                     output,
+                     self.layer_name,
++                    q_int16_scale=q_int16_scale,
+                     kv_cache_dummy_dep=kv_cache_dummy_dep,
+                 )
+             else:
+@@ -485,6 +547,7 @@ class Attention(nn.Module, AttentionLayerBase):
+                     value,
+                     output,
+                     self.layer_name,
++                    q_int16_scale=q_int16_scale,
+                     kv_cache_dummy_dep=kv_cache_dummy_dep,
+                 )
+             return output.view(-1, hidden_size)
+@@ -636,9 +699,18 @@ def unified_attention(
+     key: torch.Tensor,
+     value: torch.Tensor,
+     layer_name: str,
++    q_int16_scale: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
+-    output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
++    output = self.impl.forward(
++        self,
++        query,
++        key,
++        value,
++        kv_cache,
++        attn_metadata,
++        q_int16_scale=q_int16_scale,
++    )
+ 
+     return output
+ 
+@@ -648,6 +720,7 @@ def unified_attention_fake(
+     key: torch.Tensor,
+     value: torch.Tensor,
+     layer_name: str,
++    q_int16_scale: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     return torch.empty_like(query).contiguous()
+ 
+@@ -707,6 +780,7 @@ def unified_attention_with_output(
+     value: torch.Tensor,
+     output: torch.Tensor,
+     layer_name: str,
++    q_int16_scale: torch.Tensor | None = None,
+     output_scale: torch.Tensor | None = None,
+     output_block_scale: torch.Tensor | None = None,
+     kv_cache_dummy_dep: torch.Tensor | None = None,
+@@ -725,6 +799,7 @@ def unified_attention_with_output(
+         kv_cache,
+         attn_metadata,
+         output=output,
++        q_int16_scale=q_int16_scale,
+         output_scale=output_scale,
+         output_block_scale=output_block_scale,
+     )
+@@ -736,6 +811,7 @@ def unified_attention_with_output_fake(
+     value: torch.Tensor,
+     output: torch.Tensor,
+     layer_name: str,
++    q_int16_scale: torch.Tensor | None = None,
+     output_scale: torch.Tensor | None = None,
+     output_block_scale: torch.Tensor | None = None,
+     kv_cache_dummy_dep: torch.Tensor | None = None,
+diff --git a/vllm/model_executor/layers/blaslt_fp32_gemm.py b/vllm/model_executor/layers/blaslt_fp32_gemm.py
+new file mode 100644
+index 000000000..97d5f5f36
+--- /dev/null
++++ b/vllm/model_executor/layers/blaslt_fp32_gemm.py
+@@ -0,0 +1,647 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""FP32-output GEMM helpers for HEAL runs."""
++
++from __future__ import annotations
++
++import atexit
++import json
++import os
++
++import torch
++import torch.nn.functional as F
++
++import vllm._custom_ops as ops
++from vllm.platforms import current_platform
++from vllm.triton_utils import HAS_TRITON, tl, triton
++
++_INT8_SPLIT_STATS: dict[str, dict[str, object]] = {}
++_INT8_SPLIT_STATS_REGISTERED = False
++
++
++def _heal_use_int8_gemm_split(layer: torch.nn.Module | None) -> bool:
++    if layer is None:
++        return False
++    try:
++        from vllm.model_executor.models.heal_runtime import use_int8_gemm_split
++
++        return use_int8_gemm_split(layer)
++    except Exception:
++        return False
++
++
++def _heal_prepare_int8_gemm_weight(layer: torch.nn.Module) -> None:
++    from vllm.model_executor.models.heal_runtime import prepare_int8_gemm_weight
++
++    prepare_int8_gemm_weight(layer)
++
++
++def _heal_dynamic_int8_gemm_weight() -> bool:
++    from vllm.model_executor.models.heal_runtime import (
++        dynamic_int8_gemm_weight_enabled,
++    )
++
++    return dynamic_int8_gemm_weight_enabled()
++
++
++def _heal_dynamic_int8_gemm_weight_chunk_rows() -> int:
++    from vllm.model_executor.models.heal_runtime import (
++        dynamic_int8_gemm_weight_chunk_rows,
++    )
++
++    return dynamic_int8_gemm_weight_chunk_rows()
++
++
++def _allow_triton_fp32_gemm() -> bool:
++    return os.environ.get("HEAL_ALLOW_TRITON_FP32_GEMM", "").lower() in {
++        "1",
++        "true",
++        "yes",
++        "on",
++    }
++
++
++def _int8_split_stats_path() -> str | None:
++    path = os.environ.get("HEAL_INT8_GEMM_STATS_FILE")
++    if not path:
++        return None
++    return path.format(pid=os.getpid())
++
++
++def _int8_split_stats_enabled() -> bool:
++    return _int8_split_stats_path() is not None
++
++
++def _layer_name(layer: torch.nn.Module | None) -> tuple[str, str]:
++    if layer is None:
++        return "", "None"
++    return str(getattr(layer, "prefix", "")), layer.__class__.__name__
++
++
++def _bump_dtype_count(entry: dict[str, object], field: str, dtype: torch.dtype) -> None:
++    counts = entry.setdefault(field, {})
++    assert isinstance(counts, dict)
++    key = str(dtype)
++    counts[key] = int(counts.get(key, 0)) + 1
++
++
++def _stats_float(tensor: torch.Tensor) -> float:
++    return float(tensor.detach().to(torch.float32).item())
++
++
++def _stats_rms(tensor: torch.Tensor) -> float:
++    if tensor.numel() == 0:
++        return 0.0
++    return _stats_float(tensor.detach().to(torch.float32).pow(2).mean().sqrt())
++
++
++def _write_int8_split_stats() -> None:
++    path = _int8_split_stats_path()
++    if not path or not _INT8_SPLIT_STATS:
++        return
++    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
++    totals = {
++        "calls": 0,
++        "rows": 0,
++        "missing_weight_calls": 0,
++        "zero_residual_calls": 0,
++    }
++    layers = []
++    for entry in sorted(
++        _INT8_SPLIT_STATS.values(),
++        key=lambda item: (str(item.get("prefix", "")), str(item.get("class_name", ""))),
++    ):
++        calls = int(entry.get("calls", 0))
++        rows = int(entry.get("rows", 0))
++        totals["calls"] += calls
++        totals["rows"] += rows
++        totals["missing_weight_calls"] += int(entry.get("missing_weight_calls", 0))
++        totals["zero_residual_calls"] += int(entry.get("zero_residual_calls", 0))
++        if calls:
++            for field in (
++                "residual_abs_mean",
++                "residual_rms",
++                "q_nonzero_frac",
++                "compensation_rms",
++                "base_rms",
++                "compensation_base_rms_ratio",
++            ):
++                sum_field = f"{field}_sum"
++                if sum_field in entry:
++                    entry[f"{field}_avg"] = float(entry[sum_field]) / calls
++        layers.append(entry)
++    payload = {
++        "pid": os.getpid(),
++        "version": 1,
++        "totals": totals,
++        "layers": layers,
++    }
++    tmp_path = f"{path}.tmp"
++    with open(tmp_path, "w", encoding="utf-8") as handle:
++        json.dump(payload, handle, indent=2, sort_keys=True)
++    os.replace(tmp_path, path)
++
++
++def _ensure_int8_split_stats_registered() -> None:
++    global _INT8_SPLIT_STATS_REGISTERED
++    if _INT8_SPLIT_STATS_REGISTERED:
++        return
++    atexit.register(_write_int8_split_stats)
++    _INT8_SPLIT_STATS_REGISTERED = True
++
++
++def _int8_split_stats_entry(
++    layer: torch.nn.Module | None,
++    x: torch.Tensor,
++    weight: torch.Tensor,
++) -> dict[str, object] | None:
++    if not _int8_split_stats_enabled():
++        return None
++    _ensure_int8_split_stats_registered()
++    prefix, class_name = _layer_name(layer)
++    key = f"{prefix}\0{class_name}\0{tuple(weight.shape)}"
++    entry = _INT8_SPLIT_STATS.setdefault(
++        key,
++        {
++            "prefix": prefix,
++            "class_name": class_name,
++            "weight_shape": list(weight.shape),
++            "calls": 0,
++            "rows": 0,
++            "m_min": None,
++            "m_max": 0,
++            "k": int(weight.shape[1]),
++            "n": int(weight.shape[0]),
++            "missing_weight_calls": 0,
++            "zero_residual_calls": 0,
++        },
++    )
++    _bump_dtype_count(entry, "x_dtypes", x.dtype)
++    _bump_dtype_count(entry, "weight_dtypes", weight.dtype)
++    return entry
++
++
++def _record_int8_split_stats(
++    layer: torch.nn.Module,
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    base: torch.Tensor,
++    residual: torch.Tensor,
++    q_activation: torch.Tensor,
++    compensation: torch.Tensor,
++    max_abs: torch.Tensor,
++    act_scale: torch.Tensor,
++) -> None:
++    entry = _int8_split_stats_entry(layer, x, weight)
++    if entry is None:
++        return
++    m = int(x.shape[0])
++    entry["calls"] = int(entry["calls"]) + 1
++    entry["rows"] = int(entry["rows"]) + m
++    entry["m_min"] = m if entry["m_min"] is None else min(int(entry["m_min"]), m)
++    entry["m_max"] = max(int(entry["m_max"]), m)
++    residual_abs = residual.detach().abs()
++    residual_rms = _stats_rms(residual)
++    base_rms = _stats_rms(base)
++    compensation_rms = _stats_rms(compensation)
++    ratio = compensation_rms / base_rms if base_rms > 0.0 else 0.0
++    max_abs_value = max_abs.detach().to(torch.float32).amax()
++    act_scale_value = act_scale.detach().to(torch.float32).amax()
++    entry["residual_max_max"] = max(
++        float(entry.get("residual_max_max", 0.0)),
++        _stats_float(max_abs_value),
++    )
++    entry["act_scale_max"] = max(
++        float(entry.get("act_scale_max", 0.0)),
++        _stats_float(act_scale_value),
++    )
++    entry["residual_abs_mean_sum"] = float(entry.get("residual_abs_mean_sum", 0.0)) + (
++        _stats_float(residual_abs.mean()) if residual_abs.numel() else 0.0
++    )
++    entry["residual_rms_sum"] = float(entry.get("residual_rms_sum", 0.0)) + residual_rms
++    entry["q_nonzero_frac_sum"] = float(entry.get("q_nonzero_frac_sum", 0.0)) + (
++        _stats_float((q_activation != 0).to(torch.float32).mean())
++        if q_activation.numel()
++        else 0.0
++    )
++    entry["compensation_rms_sum"] = (
++        float(entry.get("compensation_rms_sum", 0.0)) + compensation_rms
++    )
++    entry["base_rms_sum"] = float(entry.get("base_rms_sum", 0.0)) + base_rms
++    entry["compensation_base_rms_ratio_sum"] = (
++        float(entry.get("compensation_base_rms_ratio_sum", 0.0)) + ratio
++    )
++    if bool((max_abs == 0).all().item()):
++        entry["zero_residual_calls"] = int(entry["zero_residual_calls"]) + 1
++
++
++def _record_int8_split_missing_weight_stats(
++    layer: torch.nn.Module,
++    x: torch.Tensor,
++    weight: torch.Tensor,
++) -> None:
++    entry = _int8_split_stats_entry(layer, x, weight)
++    if entry is None:
++        return
++    m = int(x.shape[0])
++    entry["calls"] = int(entry["calls"]) + 1
++    entry["rows"] = int(entry["rows"]) + m
++    entry["m_min"] = m if entry["m_min"] is None else min(int(entry["m_min"]), m)
++    entry["m_max"] = max(int(entry["m_max"]), m)
++    entry["missing_weight_calls"] = int(entry["missing_weight_calls"]) + 1
++
++
++def _torch_is_compiling() -> bool:
++    try:
++        return bool(torch.compiler.is_compiling())
++    except Exception:
++        try:
++            return bool(torch._dynamo.is_compiling())
++        except Exception:
++            return False
++
++
++if HAS_TRITON:
++
++    @triton.autotune(
++        configs=[
++            triton.Config(
++                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64},
++                num_stages=3,
++                num_warps=8,
++            ),
++            triton.Config(
++                {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 32},
++                num_stages=4,
++                num_warps=4,
++            ),
++            triton.Config(
++                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
++                num_stages=4,
++                num_warps=4,
++            ),
++            triton.Config(
++                {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
++                num_stages=4,
++                num_warps=4,
++            ),
++            triton.Config(
++                {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
++                num_stages=4,
++                num_warps=4,
++            ),
++            triton.Config(
++                {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
++                num_stages=4,
++                num_warps=2,
++            ),
++        ],
++        key=["M", "N", "K"],
++    )
++    @triton.jit
++    def _triton_fp32_gemm_kernel(
++        a_ptr,
++        b_ptr,
++        c_ptr,
++        bias_ptr,
++        M,
++        N,
++        K,
++        stride_am,
++        stride_ak,
++        stride_bk,
++        stride_bn,
++        stride_cm,
++        stride_cn,
++        HAS_BIAS: tl.constexpr,
++        BLOCK_SIZE_M: tl.constexpr,
++        BLOCK_SIZE_N: tl.constexpr,
++        BLOCK_SIZE_K: tl.constexpr,
++    ):
++        pid_m = tl.program_id(axis=0)
++        pid_n = tl.program_id(axis=1)
++
++        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++        offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++        offs_k = tl.arange(0, BLOCK_SIZE_K)
++
++        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
++        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
++
++        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++        for k_start in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
++            remaining_k = K - k_start * BLOCK_SIZE_K
++            a = tl.load(
++                a_ptrs,
++                mask=(offs_m[:, None] < M) & (offs_k[None, :] < remaining_k),
++                other=0.0,
++            )
++            b = tl.load(
++                b_ptrs,
++                mask=(offs_k[:, None] < remaining_k) & (offs_n[None, :] < N),
++                other=0.0,
++            )
++            acc = tl.dot(a, b, acc=acc)
++            a_ptrs += BLOCK_SIZE_K * stride_ak
++            b_ptrs += BLOCK_SIZE_K * stride_bk
++
++        if HAS_BIAS:
++            bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0).to(
++                tl.float32
++            )
++            acc += bias[None, :]
++
++        c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
++        tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
++
++else:
++    _triton_fp32_gemm_kernel = None
++
++
++def _triton_fp32_gemm(
++    x: torch.Tensor,
++    weight_t: torch.Tensor,
++    bias: torch.Tensor | None = None,
++) -> torch.Tensor:
++    if not HAS_TRITON or _triton_fp32_gemm_kernel is None:
++        raise RuntimeError("Triton is required for FP32-output GEMM.")
++
++    if x.ndim != 2 or weight_t.ndim != 2:
++        raise ValueError("FP32-output GEMM expects 2D activation and weight tensors.")
++    if x.dtype != torch.float16 or weight_t.dtype != torch.float16:
++        raise TypeError(
++            "FP32-output GEMM expects float16 activation and weight inputs, "
++            f"got x={x.dtype}, weight_t={weight_t.dtype}."
++        )
++    if x.shape[1] != weight_t.shape[0]:
++        raise ValueError(
++            "Incompatible GEMM shapes: "
++            f"x={tuple(x.shape)}, weight_t={tuple(weight_t.shape)}."
++        )
++    if bias is not None and bias.numel() != weight_t.shape[1]:
++        raise ValueError(
++            "Bias shape does not match the output dimension: "
++            f"bias={tuple(bias.shape)}, N={weight_t.shape[1]}."
++        )
++
++    m, k = x.shape
++    _, n = weight_t.shape
++    out = torch.empty((m, n), device=x.device, dtype=torch.float32)
++    if m == 0 or n == 0:
++        return out
++
++    bias_arg = out if bias is None else bias
++    grid = lambda meta: (
++        triton.cdiv(m, meta["BLOCK_SIZE_M"]),
++        triton.cdiv(n, meta["BLOCK_SIZE_N"]),
++    )
++    _triton_fp32_gemm_kernel[grid](
++        a_ptr=x,
++        b_ptr=weight_t,
++        c_ptr=out,
++        bias_ptr=bias_arg,
++        M=m,
++        N=n,
++        K=k,
++        stride_am=x.stride(0),
++        stride_ak=x.stride(1),
++        stride_bk=weight_t.stride(0),
++        stride_bn=weight_t.stride(1),
++        stride_cm=out.stride(0),
++        stride_cn=out.stride(1),
++        HAS_BIAS=bias is not None,
++    )
++    return out
++
++
++def blaslt_fp32_gemm(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    output_scale: float | None = None,
++) -> torch.Tensor:
++    if x.ndim != 2 or weight.ndim != 2:
++        raise ValueError("FP32-output GEMM expects 2D activation and weight tensors.")
++    if x.shape[1] != weight.shape[1]:
++        raise ValueError(
++            "Incompatible GEMM shapes: "
++            f"x={tuple(x.shape)}, weight={tuple(weight.shape)}."
++        )
++
++    if current_platform.is_cuda_alike() and hasattr(
++        torch.ops._C, "blaslt_fp32_output_gemm"
++    ):
++        if x.dtype != weight.dtype:
++            x = x.to(weight.dtype)
++        x = x.contiguous()
++        weight = weight.contiguous()
++        out = torch.empty(
++            (x.shape[0], weight.shape[0]),
++            device=x.device,
++            dtype=torch.float32,
++        )
++        ops.blaslt_fp32_output_gemm(out, x, weight, None)
++    elif current_platform.is_cuda_alike() and weight.dtype == torch.float16:
++        if not _allow_triton_fp32_gemm():
++            raise RuntimeError(
++                "HEAL FP32-output GEMM requires the native "
++                "torch.ops._C.blaslt_fp32_output_gemm op. The Triton fallback "
++                "is available only when HEAL_ALLOW_TRITON_FP32_GEMM=1 is set "
++                "explicitly."
++            )
++        if x.dtype != torch.float16:
++            x = x.to(torch.float16)
++        out = _triton_fp32_gemm(x.contiguous(), weight.t().contiguous(), None)
++    else:
++        out = F.linear(x.to(torch.float32), weight.to(torch.float32), None)
++
++    if output_scale is not None and output_scale != 1.0:
++        out.mul_(1.0 / output_scale)
++    if bias is not None:
++        out.add_(bias.to(torch.float32))
++    return out
++
++
++def _int8_split_scaled_mm_fp32(
++    q_activation: torch.Tensor,
++    q_weight_t: torch.Tensor,
++    act_scale: torch.Tensor,
++    weight_scale: torch.Tensor,
++) -> torch.Tensor:
++    if not HAS_TRITON:
++        raise RuntimeError(
++            "HEAL INT8 compensation requires Triton scaled_mm, but Triton is "
++            "not available in this environment."
++        )
++    if not q_activation.is_cuda:
++        raise RuntimeError(
++            "HEAL INT8 compensation requires CUDA tensors because "
++            "triton_scaled_mm only runs on CUDA."
++        )
++    if q_activation.ndim != 2 or q_weight_t.ndim != 2:
++        raise RuntimeError(
++            "HEAL INT8 compensation expects 2D activation and weight tensors, "
++            f"got q_activation={tuple(q_activation.shape)}, "
++            f"q_weight_t={tuple(q_weight_t.shape)}."
++        )
++    m, k = q_activation.shape
++    weight_k, n = q_weight_t.shape
++    if weight_k != k:
++        raise RuntimeError(
++            "HEAL INT8 compensation shape mismatch: "
++            f"q_activation={tuple(q_activation.shape)}, "
++            f"q_weight_t={tuple(q_weight_t.shape)}."
++        )
++    if act_scale.numel() != m:
++        raise RuntimeError(
++            "HEAL INT8 compensation activation scale must be per-row "
++            f"with {m} entries, got shape={tuple(act_scale.shape)}."
++        )
++    if weight_scale.numel() != n:
++        raise RuntimeError(
++            "HEAL INT8 compensation weight scale must be per-output "
++            f"with {n} entries, got shape={tuple(weight_scale.shape)}."
++        )
++    if q_weight_t.stride(0) != 1:
++        q_weight_t = q_weight_t.t().contiguous().t()
++
++    try:
++        from vllm.model_executor.layers.quantization.compressed_tensors.triton_scaled_mm import (  # noqa: E501
++            triton_scaled_mm,
++        )
++    except Exception as exc:
++        raise RuntimeError(
++            "HEAL INT8 compensation requires vLLM's triton_scaled_mm helper, "
++            "but it could not be imported."
++        ) from exc
++
++    try:
++        return triton_scaled_mm(
++            q_activation,
++            q_weight_t,
++            act_scale.contiguous(),
++            weight_scale.contiguous(),
++            torch.float32,
++        )
++    except Exception as exc:
++        raise RuntimeError(
++            "HEAL INT8 compensation is unsupported for this scaled_mm call: "
++            f"q_activation={tuple(q_activation.shape)} {q_activation.dtype}, "
++            f"q_weight_t={tuple(q_weight_t.shape)} {q_weight_t.dtype}, "
++            f"act_scale={tuple(act_scale.shape)} {act_scale.dtype}, "
++            f"weight_scale={tuple(weight_scale.shape)} {weight_scale.dtype}."
++        ) from exc
++
++
++def _dynamic_int8_split_weight(
++    weight: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if weight.ndim != 2 or not torch.is_floating_point(weight):
++        raise RuntimeError(
++            "HEAL dynamic INT8 compensation expects a 2D floating-point "
++            f"weight tensor, got shape={tuple(weight.shape)} dtype={weight.dtype}."
++        )
++    q_weight = torch.empty(weight.shape, device=weight.device, dtype=torch.int8)
++    weight_scale = torch.empty(
++        (weight.shape[0],), device=weight.device, dtype=torch.float32
++    )
++    chunk_rows = _heal_dynamic_int8_gemm_weight_chunk_rows()
++    tiny = torch.finfo(torch.float32).tiny
++    with torch.no_grad():
++        for start in range(0, weight.shape[0], chunk_rows):
++            end = min(start + chunk_rows, weight.shape[0])
++            weight_chunk = weight[start:end].detach()
++            scale = weight_chunk.abs().amax(dim=1).to(torch.float32)
++            scale = scale.clamp_min(tiny).div(127.0)
++            q_chunk = torch.round(
++                weight_chunk.to(torch.float32) / scale[:, None]
++            ).clamp_(-127, 127)
++            q_weight[start:end].copy_(q_chunk.to(torch.int8))
++            weight_scale[start:end].copy_(scale)
++    return q_weight.t(), weight_scale.contiguous()
++
++
++def _int8_split_compensation(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    layer: torch.nn.Module,
++    base: torch.Tensor | None = None,
++) -> torch.Tensor:
++    if x.shape[0] == 0 or weight.shape[0] == 0:
++        return x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.float32)
++
++    if _heal_dynamic_int8_gemm_weight():
++        q_weight_t, weight_scale = _dynamic_int8_split_weight(weight)
++    else:
++        q_weight_t = getattr(layer, "_heal_int8_gemm_weight_t", None)
++        weight_scale = getattr(layer, "_heal_int8_gemm_weight_scale", None)
++        if (
++            q_weight_t is None
++            or weight_scale is None
++            or q_weight_t.shape != (weight.shape[1], weight.shape[0])
++            or q_weight_t.device != weight.device
++        ):
++            _heal_prepare_int8_gemm_weight(layer)
++            q_weight_t = getattr(layer, "_heal_int8_gemm_weight_t", None)
++            weight_scale = getattr(layer, "_heal_int8_gemm_weight_scale", None)
++        if q_weight_t is None or weight_scale is None:
++            _record_int8_split_missing_weight_stats(layer, x, weight)
++            prefix, class_name = _layer_name(layer)
++            raise RuntimeError(
++                "HEAL INT8 compensation is enabled but no prepared INT8 weight "
++                "buffer is available for layer "
++                f"prefix={prefix!r} class={class_name}."
++            )
++
++    x_fp32 = x.to(torch.float32)
++    x_fp16 = x_fp32.to(torch.float16).to(torch.float32)
++    residual = x_fp32 - x_fp16
++    max_abs = residual.abs().amax(dim=1)
++    inv_scale = torch.where(
++        max_abs > 0,
++        max_abs.reciprocal() * 127.0,
++        torch.zeros_like(max_abs),
++    )
++    act_scale = max_abs / 127.0
++    q_activation = torch.round(residual * inv_scale[:, None]).clamp_(-127, 127)
++    q_activation = q_activation.to(torch.int8).contiguous()
++
++    compensation = _int8_split_scaled_mm_fp32(
++        q_activation,
++        q_weight_t,
++        act_scale,
++        weight_scale,
++    )
++    if base is not None:
++        _record_int8_split_stats(
++            layer,
++            x,
++            weight,
++            base,
++            residual,
++            q_activation,
++            compensation,
++            max_abs,
++            act_scale,
++        )
++    return compensation
++
++
++def fp32_output_linear(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None = None,
++    output_scale: float | None = None,
++    layer: torch.nn.Module | None = None,
++) -> torch.Tensor:
++    x_2d = x.reshape(-1, x.shape[-1])
++    if _heal_use_int8_gemm_split(layer):
++        out = blaslt_fp32_gemm(x_2d, weight, None, None)
++        out.add_(_int8_split_compensation(x_2d, weight, layer, out))
++        if output_scale is not None and output_scale != 1.0:
++            out.mul_(1.0 / output_scale)
++        if bias is not None:
++            out.add_(bias.to(torch.float32))
++    else:
++        out = blaslt_fp32_gemm(x_2d, weight, bias, output_scale)
++    return out.reshape(*x.shape[:-1], weight.shape[0])
+diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
+index 7fa804587..c97038315 100644
+--- a/vllm/model_executor/layers/layernorm.py
++++ b/vllm/model_executor/layers/layernorm.py
+@@ -18,6 +18,24 @@ from vllm.platforms import current_platform
+ logger = init_logger(__name__)
+ 
+ 
++def _heal_fp32_stream_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.heal_runtime import fp32_stream_enabled
++
++        return fp32_stream_enabled()
++    except Exception:
++        return False
++
++
++def _heal_keep_bf16_norm_weight() -> bool:
++    try:
++        from vllm.model_executor.models.heal_runtime import keep_bf16_norm_weight
++
++        return keep_bf16_norm_weight()
++    except Exception:
++        return False
++
++
+ def _can_view_as_2d(x: torch.Tensor) -> bool:
+     """Return True if x.view(-1, x.shape[-1]) is viewable (no copy)."""
+     if x.dim() < 2:
+@@ -89,6 +107,52 @@ def fused_add_rms_norm(
+     return x, residual
+ 
+ 
++def _heal_can_use_fp32_rms_norm(
++    x: torch.Tensor,
++    residual: torch.Tensor | None,
++    weight: torch.Tensor | None,
++) -> bool:
++    if envs.VLLM_BATCH_INVARIANT or weight is None:
++        return False
++    if not x.is_cuda or x.dtype != torch.float32:
++        return False
++    if not weight.is_cuda or not weight.is_contiguous():
++        return False
++    if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
++        return False
++    if residual is None:
++        return True
++    return (
++        x.stride(-1) == 1
++        and residual.is_cuda
++        and residual.dtype == torch.float32
++        and residual.shape == x.shape
++        and residual.is_contiguous()
++    )
++
++
++def heal_rms_norm_fp32(
++    x: torch.Tensor, weight: torch.Tensor, variance_epsilon: float
++) -> torch.Tensor:
++    from vllm import _custom_ops as ops
++
++    out = torch.empty_like(x, dtype=torch.float32)
++    ops.heal_rms_norm_fp32(out, x, weight, variance_epsilon)
++    return out
++
++
++def heal_fused_add_rms_norm_fp32(
++    x: torch.Tensor,
++    residual: torch.Tensor,
++    weight: torch.Tensor,
++    variance_epsilon: float,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    from vllm import _custom_ops as ops
++
++    ops.heal_fused_add_rms_norm_fp32(x, residual, weight, variance_epsilon)
++    return x, residual
++
++
+ def poly_norm(
+     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, variance_epsilon: float
+ ) -> torch.Tensor:
+@@ -143,7 +207,7 @@ class RMSNorm(CustomOp):
+         has_weight: bool = True,
+         dtype: torch.dtype | None = None,
+     ) -> None:
+-        super().__init__()
++        super().__init__(enforce_enable=_heal_fp32_stream_enabled())
+ 
+         self.hidden_size = hidden_size
+         self.variance_epsilon = eps
+@@ -151,6 +215,8 @@ class RMSNorm(CustomOp):
+             None if var_hidden_size == hidden_size else var_hidden_size
+         )
+         weight_dtype = dtype or torch.get_default_dtype()
++        if weight_dtype == torch.float16 and _heal_keep_bf16_norm_weight():
++            weight_dtype = torch.bfloat16
+         self.has_weight = has_weight
+         self.weight = torch.ones(hidden_size, dtype=weight_dtype)
+         if self.has_weight:
+@@ -271,12 +337,15 @@ class RMSNorm(CustomOp):
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         """PyTorch-native implementation equivalent to forward()."""
+ 
++        weight = self.weight.data if self.has_weight else None
++        if _heal_fp32_stream_enabled() and weight is not None:
++            weight = weight.to(torch.float32)
+         return self.forward_static(
+             x,
+             self.variance_epsilon,
+             self.hidden_size,
+             x.dtype,
+-            self.weight.data if self.has_weight else None,
++            weight,
+             residual,
+             self.variance_size_override,
+         )
+@@ -288,6 +357,16 @@ class RMSNorm(CustomOp):
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         if self.variance_size_override is not None:
+             return self.forward_native(x, residual)
++        if _heal_fp32_stream_enabled():
++            weight = self.weight.data if self.has_weight else None
++            if _heal_can_use_fp32_rms_norm(x, residual, weight):
++                assert weight is not None
++                if residual is not None:
++                    return heal_fused_add_rms_norm_fp32(
++                        x, residual, weight, self.variance_epsilon
++                    )
++                return heal_rms_norm_fp32(x, weight, self.variance_epsilon)
++            return self.forward_native(x, residual)
+ 
+         # Optional Oink SM100 fast path (no residual). This path is
+         # torch.compile-friendly via torch.ops.oink.rmsnorm and preserves
+@@ -371,6 +450,8 @@ class RMSNorm(CustomOp):
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         if self.variance_size_override is not None:
+             return self.forward_native(x, residual)
++        if _heal_fp32_stream_enabled():
++            return self.forward_native(x, residual)
+ 
+         add_residual = residual is not None
+         if add_residual:
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 44fd516f5..687e6a267 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -42,6 +42,65 @@ from vllm.platforms import current_platform
+ 
+ logger = init_logger(__name__)
+ 
++
++def _heal_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.heal_runtime import enabled
++
++        return enabled()
++    except Exception:
++        return False
++
++
++def _heal_fp32_output_gemm(layer: torch.nn.Module) -> bool:
++    try:
++        from vllm.model_executor.models.heal_runtime import use_fp32_output_gemm
++
++        return use_fp32_output_gemm(layer)
++    except Exception:
++        return False
++
++
++def _heal_prepare_loaded_weight(
++    layer: torch.nn.Module,
++    param: torch.Tensor,
++    loaded_weight: torch.Tensor,
++) -> torch.Tensor:
++    from vllm.model_executor.models.heal_runtime import prepare_loaded_weight
++
++    return prepare_loaded_weight(layer, param, loaded_weight)
++
++
++def _heal_weight_output_scale(layer: torch.nn.Module) -> float | None:
++    from vllm.model_executor.models.heal_runtime import weight_output_scale
++
++    return weight_output_scale(layer)
++
++
++def _heal_prepare_int8_gemm_weight(layer: torch.nn.Module) -> None:
++    try:
++        from vllm.model_executor.models.heal_runtime import prepare_int8_gemm_weight
++
++        prepare_int8_gemm_weight(layer)
++    except Exception:
++        pass
++
++
++def _heal_gemm_bias_dtype(
++    layer: torch.nn.Module, params_dtype: torch.dtype
++) -> torch.dtype:
++    if params_dtype != torch.float16:
++        return params_dtype
++    try:
++        from vllm.model_executor.models.heal_runtime import keep_bf16_gemm_bias
++
++        if keep_bf16_gemm_bias(layer):
++            return torch.bfloat16
++    except Exception:
++        pass
++    return params_dtype
++
++
+ WEIGHT_LOADER_V2_SUPPORTED = [
+     "UnquantizedLinearMethod",
+     "CompressedTensorsLinearMethod",
+@@ -216,6 +275,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
+             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
+ 
+             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
++        _heal_prepare_int8_gemm_weight(layer)
+ 
+     def apply(
+         self,
+@@ -223,6 +283,27 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if _heal_enabled() and torch.is_floating_point(x):
++            weight = layer.weight
++            if torch.is_floating_point(weight):
++                if _heal_fp32_output_gemm(layer):
++                    from vllm.model_executor.layers.blaslt_fp32_gemm import (
++                        fp32_output_linear,
++                    )
++
++                    return fp32_output_linear(
++                        x, weight, bias, _heal_weight_output_scale(layer), layer
++                    )
++                target_dtype = weight.dtype
++                x = x if x.dtype == target_dtype else x.to(target_dtype)
++                if bias is not None:
++                    bias = bias if bias.dtype == target_dtype else bias.to(target_dtype)
++                output = dispatch_unquantized_gemm()(layer, x, weight, bias)
++                return (
++                    output
++                    if output.dtype == torch.float32
++                    else output.to(torch.float32)
++                )
+         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+             return linear_batch_invariant(x, layer.weight, bias)
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+@@ -346,7 +427,10 @@ class ReplicatedLinear(LinearBase):
+ 
+         if bias:
+             self.bias = Parameter(
+-                torch.empty(self.output_size, dtype=self.params_dtype)
++                torch.empty(
++                    self.output_size,
++                    dtype=_heal_gemm_bias_dtype(self, self.params_dtype),
++                )
+             )
+             set_weight_attrs(
+                 self.bias,
+@@ -379,7 +463,7 @@ class ReplicatedLinear(LinearBase):
+             f"Tried to load weights of size {loaded_weight.size()}"
+             f"to a parameter of size {param.size()}"
+         )
+-        param.data.copy_(loaded_weight)
++        param.data.copy_(_heal_prepare_loaded_weight(self, param, loaded_weight))
+ 
+     def forward(
+         self,
+@@ -486,7 +570,10 @@ class ColumnParallelLinear(LinearBase):
+         )
+         if bias:
+             self.bias = Parameter(
+-                torch.empty(self.output_size_per_partition, dtype=params_dtype)
++                torch.empty(
++                    self.output_size_per_partition,
++                    dtype=_heal_gemm_bias_dtype(self, params_dtype),
++                )
+             )
+             set_weight_attrs(
+                 self.bias,
+@@ -561,7 +648,7 @@ class ColumnParallelLinear(LinearBase):
+             loaded_weight = loaded_weight.reshape(1)
+ 
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        param_data.copy_(_heal_prepare_loaded_weight(self, param, loaded_weight))
+ 
+     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
+         # Special case for loading scales off disk, which often do not
+@@ -569,6 +656,7 @@ class ColumnParallelLinear(LinearBase):
+         if len(loaded_weight.shape) == 0:
+             assert loaded_weight.numel() == 1
+             loaded_weight = loaded_weight.reshape(1)
++        loaded_weight = _heal_prepare_loaded_weight(self, param, loaded_weight)
+         param.load_column_parallel_weight(loaded_weight=loaded_weight)
+ 
+     def forward(
+@@ -740,7 +828,9 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
+                     )
+ 
+                 assert param_data.shape == loaded_weight.shape
+-                param_data.copy_(loaded_weight)
++                param_data.copy_(
++                    _heal_prepare_loaded_weight(self, param, loaded_weight)
++                )
+                 return
+ 
+             output_sizes = (
+@@ -860,7 +950,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
+                 )
+ 
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        param_data.copy_(_heal_prepare_loaded_weight(self, param, loaded_weight))
+ 
+     def _load_fused_module_from_checkpoint(
+         self,
+@@ -911,9 +1001,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
+         self.validate_shard_id(loaded_shard_id)
+         if loaded_shard_id is None or isinstance(loaded_shard_id, tuple):
+             if isinstance(param, PerTensorScaleParameter):
++                loaded_weight = _heal_prepare_loaded_weight(
++                    self, param, loaded_weight
++                )
+                 param.load_merged_column_weight(loaded_weight=loaded_weight, shard_id=0)
+                 return
+             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
++                loaded_weight = _heal_prepare_loaded_weight(
++                    self, param, loaded_weight
++                )
+                 param.load_merged_column_weight(loaded_weight=loaded_weight)
+                 return
+             output_sizes = (
+@@ -946,6 +1042,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
+                 weight_block_size, shard_size, shard_offset
+             )
+ 
++        loaded_weight = _heal_prepare_loaded_weight(self, param, loaded_weight)
+         param.load_merged_column_weight(
+             loaded_weight=loaded_weight,
+             shard_id=loaded_shard_id,
+@@ -1123,11 +1220,17 @@ class QKVParallelLinear(ColumnParallelLinear):
+         self.validate_shard_id(loaded_shard_id)
+         if loaded_shard_id is None:  # special case for certain models
+             if isinstance(param, PerTensorScaleParameter):
++                loaded_weight = _heal_prepare_loaded_weight(
++                    self, param, loaded_weight
++                )
+                 param.load_qkv_weight(
+                     loaded_weight=loaded_weight, shard_id=0, tp_rank=self.tp_rank
+                 )
+                 return
+             elif type(param) in (RowvLLMParameter, BasevLLMParameter):
++                loaded_weight = _heal_prepare_loaded_weight(
++                    self, param, loaded_weight
++                )
+                 param.load_qkv_weight(loaded_weight=loaded_weight, tp_rank=self.tp_rank)
+                 return
+             # TODO: @dsikka - move to parameter.py
+@@ -1145,6 +1248,7 @@ class QKVParallelLinear(ColumnParallelLinear):
+                 weight_block_size, shard_size, shard_offset
+             )
+ 
++        loaded_weight = _heal_prepare_loaded_weight(self, param, loaded_weight)
+         param.load_qkv_weight(
+             loaded_weight=loaded_weight,
+             num_heads=self.num_kv_head_replicas,
+@@ -1202,7 +1306,9 @@ class QKVParallelLinear(ColumnParallelLinear):
+                     )
+ 
+                 assert param_data.shape == loaded_weight.shape
+-                param_data.copy_(loaded_weight)
++                param_data.copy_(
++                    _heal_prepare_loaded_weight(self, param, loaded_weight)
++                )
+                 return
+             shard_offsets = [
+                 # (shard_id, shard_offset, shard_size)
+@@ -1356,7 +1462,7 @@ class QKVParallelLinear(ColumnParallelLinear):
+                 )
+ 
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        param_data.copy_(_heal_prepare_loaded_weight(self, param, loaded_weight))
+ 
+ 
+ # --8<-- [start:row_parallel_linear]
+@@ -1453,7 +1559,12 @@ class RowParallelLinear(LinearBase):
+             )
+ 
+         if bias:
+-            self.bias = Parameter(torch.empty(self.output_size, dtype=params_dtype))
++            self.bias = Parameter(
++                torch.empty(
++                    self.output_size,
++                    dtype=_heal_gemm_bias_dtype(self, params_dtype),
++                )
++            )
+             set_weight_attrs(
+                 self.bias,
+                 {
+@@ -1498,7 +1609,7 @@ class RowParallelLinear(LinearBase):
+             loaded_weight = loaded_weight.reshape(1)
+ 
+         assert param_data.shape == loaded_weight.shape
+-        param_data.copy_(loaded_weight)
++        param_data.copy_(_heal_prepare_loaded_weight(self, param, loaded_weight))
+ 
+     def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
+         # Special case for loading scales off disk, which often do not
+@@ -1507,6 +1618,7 @@ class RowParallelLinear(LinearBase):
+             assert loaded_weight.numel() == 1
+             loaded_weight = loaded_weight.reshape(1)
+ 
++        loaded_weight = _heal_prepare_loaded_weight(self, param, loaded_weight)
+         param.load_row_parallel_weight(loaded_weight=loaded_weight)
+ 
+     def forward(
+diff --git a/vllm/model_executor/layers/rotary_embedding/__init__.py b/vllm/model_executor/layers/rotary_embedding/__init__.py
+index 28157daab..b40986f8e 100644
+--- a/vllm/model_executor/layers/rotary_embedding/__init__.py
++++ b/vllm/model_executor/layers/rotary_embedding/__init__.py
+@@ -26,6 +26,15 @@ from .yarn_scaling_rope import YaRNScalingRotaryEmbedding
+ _ROPE_DICT: dict[tuple[Any, ...], RotaryEmbedding] = {}
+ 
+ 
++def _heal_fp32_stream_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.heal_runtime import fp32_stream_enabled
++
++        return fp32_stream_enabled()
++    except Exception:
++        return False
++
++
+ def get_rope(
+     head_size: int,
+     max_position: int,
+@@ -34,7 +43,9 @@ def get_rope(
+     dtype: torch.dtype | None = None,
+     dual_chunk_attention_config: dict[str, Any] | None = None,
+ ) -> RotaryEmbedding:
+-    if dtype is None:
++    if _heal_fp32_stream_enabled():
++        dtype = torch.float32
++    elif dtype is None:
+         dtype = torch.get_default_dtype()
+     if rope_parameters is not None:
+         # Transforms every value that is a list into a tuple for caching calls
+diff --git a/vllm/model_executor/layers/rotary_embedding/base.py b/vllm/model_executor/layers/rotary_embedding/base.py
+index 1374334b2..b9a57b46f 100644
+--- a/vllm/model_executor/layers/rotary_embedding/base.py
++++ b/vllm/model_executor/layers/rotary_embedding/base.py
+@@ -10,6 +10,15 @@ from vllm.model_executor.custom_op import CustomOp
+ from .common import ApplyRotaryEmb
+ 
+ 
++def _heal_keep_fp32_rope_cache() -> bool:
++    try:
++        from vllm.model_executor.models.heal_runtime import fp32_stream_enabled
++
++        return fp32_stream_enabled()
++    except Exception:
++        return False
++
++
+ # --8<-- [start:rotary_embedding]
+ @CustomOp.register("rotary_embedding")
+ class RotaryEmbeddingBase(CustomOp):
+@@ -101,6 +110,13 @@ class RotaryEmbeddingBase(CustomOp):
+         ):
+             return cos_sin_cache
+ 
++        if (
++            cos_sin_cache.dtype is torch.float32
++            and query.dtype is not torch.float32
++            and _heal_keep_fp32_rope_cache()
++        ):
++            return cos_sin_cache.to(query.device, dtype=query.dtype)
++
+         cos_sin_cache = cos_sin_cache.to(query.device, dtype=query.dtype)
+         # Avoid mutating buffers during torch.compile (cudagraph) tracing.
+         if torch.compiler.is_compiling():
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index daaa86bed..87373d658 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from collections.abc import Sequence
++from contextlib import contextmanager
+ from dataclasses import dataclass
+ 
+ import torch
+@@ -28,6 +29,77 @@ from vllm.platforms import current_platform
+ DEFAULT_VOCAB_PADDING_SIZE = 64
+ 
+ 
++@contextmanager
++def _heal_autocast_disabled_for(tensor: torch.Tensor):
++    # vLLM loads models under set_default_torch_dtype(model_config.dtype).
++    # Keep row-scale math in FP32 even when that ambient dtype is FP16.
++    device_type = tensor.device.type
++    with torch.amp.autocast(device_type="cpu", enabled=False):
++        if device_type in {"cuda", "xpu", "hpu"}:
++            with torch.amp.autocast(device_type=device_type, enabled=False):
++                yield
++        else:
++            yield
++
++
++def _heal_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.heal_runtime import enabled
++
++        return enabled()
++    except Exception:
++        return False
++
++
++def _heal_prepare_loaded_weight(
++    layer: torch.nn.Module,
++    param: torch.Tensor,
++    loaded_weight: torch.Tensor,
++) -> torch.Tensor:
++    from vllm.model_executor.models.heal_runtime import prepare_loaded_weight
++
++    return prepare_loaded_weight(layer, param, loaded_weight)
++
++
++def _heal_prepare_token_embedding_weight(
++    layer: torch.nn.Module,
++    param: torch.Tensor,
++    loaded_weight: torch.Tensor,
++    *,
++    target_offset: int = 0,
++) -> torch.Tensor:
++    from vllm.model_executor.models.heal_runtime import prepare_token_embedding_weight
++
++    return prepare_token_embedding_weight(
++        layer, param, loaded_weight, target_offset=target_offset
++    )
++
++
++def _heal_weight_output_scale(layer: torch.nn.Module) -> float | None:
++    from vllm.model_executor.models.heal_runtime import weight_output_scale
++
++    return weight_output_scale(layer)
++
++
++def _heal_prepare_int8_gemm_weight(layer: torch.nn.Module) -> None:
++    try:
++        from vllm.model_executor.models.heal_runtime import prepare_int8_gemm_weight
++
++        prepare_int8_gemm_weight(layer)
++    except Exception:
++        pass
++
++
++def _heal_token_embedding_scale(layer: torch.nn.Module) -> torch.Tensor | None:
++    scale = getattr(layer, "_heal_token_embedding_scale", None)
++    if scale is not None:
++        return scale
++    tied_layer = getattr(layer, "_heal_tied_embedding_layer", None)
++    if tied_layer is None:
++        return None
++    return getattr(tied_layer, "_heal_token_embedding_scale", None)
++
++
+ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+     """Unquantized method for embeddings."""
+ 
+@@ -59,6 +131,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
+ 
+             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
++        _heal_prepare_int8_gemm_weight(layer)
+ 
+     def apply(
+         self,
+@@ -66,10 +139,46 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if _heal_enabled() and torch.is_floating_point(x):
++            weight = layer.weight
++            if not torch.is_floating_point(weight) or weight.dtype not in (
++                torch.float16,
++                torch.bfloat16,
++            ):
++                raise TypeError(
++                    "HEAL embedding apply expects FP16/BF16 weight, "
++                    f"got {weight.dtype}."
++                )
++            from vllm.model_executor.layers.blaslt_fp32_gemm import (
++                fp32_output_linear,
++            )
++
++            output = fp32_output_linear(
++                x, weight, bias, _heal_weight_output_scale(layer), layer
++            )
++            token_scale = _heal_token_embedding_scale(layer)
++            if token_scale is not None:
++                with _heal_autocast_disabled_for(output):
++                    output = output.to(torch.float32)
++                    scale_shape = [1] * (output.ndim - 1) + [-1]
++                    output = output / token_scale.to(
++                        device=output.device, dtype=torch.float32
++                    ).view(scale_shape)
++            return output
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+ 
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+-        return F.embedding(input_, layer.weight)
++        output = F.embedding(input_, layer.weight)
++        token_scale = _heal_token_embedding_scale(layer)
++        if token_scale is not None:
++            with _heal_autocast_disabled_for(output):
++                output = output.to(torch.float32)
++                output = output / token_scale[input_].unsqueeze(-1).to(
++                    device=output.device, dtype=torch.float32
++                )
++        if _heal_enabled() and output.dtype != torch.float32:
++            return output.to(torch.float32)
++        return output
+ 
+ 
+ def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
+@@ -235,6 +344,7 @@ class VocabParallelEmbedding(CustomOp):
+         prefix: str = "",
+     ):
+         super().__init__()
++        self.prefix = prefix
+ 
+         # Keep the input dimensions.
+         tp_rank = get_tensor_model_parallel_rank()
+@@ -420,7 +530,8 @@ class VocabParallelEmbedding(CustomOp):
+ 
+         # If the parameter is a gguf weight, then load it directly.
+         if getattr(param, "is_gguf_weight_type", None):
+-            param.data.copy_(loaded_weight)
++            prepared_weight = _heal_prepare_loaded_weight(self, param, loaded_weight)
++            param.data.copy_(prepared_weight)
+             param.weight_type = loaded_weight.item()
+             return
+         elif isinstance(param, UninitializedParameter):
+@@ -433,7 +544,14 @@ class VocabParallelEmbedding(CustomOp):
+         # be copied onto all gpus (e.g. g_idx for act_order gptq).
+         if output_dim is None:
+             assert param.data.shape == loaded_weight.shape
+-            param.data.copy_(loaded_weight)
++            prepared_weight = _heal_prepare_token_embedding_weight(
++                self, param, loaded_weight
++            )
++            if prepared_weight is loaded_weight:
++                prepared_weight = _heal_prepare_loaded_weight(
++                    self, param, loaded_weight
++                )
++            param.data.copy_(prepared_weight)
+             return
+ 
+         # Shard indexes for loading the weight
+@@ -458,7 +576,14 @@ class VocabParallelEmbedding(CustomOp):
+ 
+         # Copy the data. Select chunk corresponding to current shard.
+         loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+-        param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
++        prepared_weight = _heal_prepare_token_embedding_weight(
++            self, param, loaded_weight
++        )
++        if prepared_weight is loaded_weight:
++            prepared_weight = _heal_prepare_loaded_weight(
++                self, param, loaded_weight
++            )
++        param[: loaded_weight.shape[0]].data.copy_(prepared_weight)
+         param[loaded_weight.shape[0] :].data.fill_(0)
+ 
+     def forward_native(self, input_):
+@@ -557,6 +682,7 @@ class ParallelLMHead(VocabParallelEmbedding):
+             return embed_tokens
+         else:
+             self.weight = embed_tokens.weight
++            self._heal_tied_embedding_layer = embed_tokens
+             return self
+ 
+     def forward(self, input_):
+diff --git a/vllm/model_executor/models/error_contribution_trace.py b/vllm/model_executor/models/error_contribution_trace.py
+new file mode 100644
+index 000000000..925cff2cf
+--- /dev/null
++++ b/vllm/model_executor/models/error_contribution_trace.py
+@@ -0,0 +1,530 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Env-gated tensor hooks for local error-contribution experiments."""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++from contextlib import contextmanager
++from collections.abc import Iterable
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++from safetensors.torch import safe_open, save_file
++
++_REFERENCE_MODE = "reference"
++_CANDIDATE_MODE = "candidate"
++_MODES = {_REFERENCE_MODE, _CANDIDATE_MODE}
++
++_TENSORS: dict[str, list[torch.Tensor]] = {}
++_MSE_TENSORS: dict[str, list[torch.Tensor]] = {}
++_PAIR_TENSORS: dict[str, list[torch.Tensor]] = {}
++_CANDIDATE_TENSORS: dict[str, list[torch.Tensor]] = {}
++_INPUT_DIFFS: dict[tuple[int, int], torch.Tensor] = {}
++_POST_DIFFS: dict[tuple[int, int], torch.Tensor] = {}
++_FINAL_NORM_INPUT_DIFFS: dict[int, torch.Tensor] = {}
++_TOKEN_FILTER_OVERRIDE: tuple[bool, tuple[int, ...], int | None] | None = None
++_WARNED: set[str] = set()
++_INPUT_STAGE_RE = re.compile(r"^layer_(\d+)\.input_layernorm\.output\.residual$")
++_POST_STAGE_RE = re.compile(r"^layer_(\d+)\.post_attention_layernorm\.output\.residual$")
++_FULL_ROW_STAGE_RE = re.compile(r"^attention\.(?:k_full|v_full)\.\d+$")
++_RAW_CANDIDATE_STAGE_RE = re.compile(
++    r"^(?:attention\.(?:q|k_full|v_full|core_output)\.\d+|"
++    r"block\.mlp\.(?:input|output)\.\d+|"
++    r"oracle\.block\.mlp\.output\.\d+)$"
++)
++_ORACLE_STAGE_RE = re.compile(r"^oracle\.")
++
++
++def _output_file() -> str:
++    return os.environ.get("VLLM_ERROR_CONTRIBUTION_OUTPUT_FILE", "")
++
++
++def _reference_file() -> str:
++    return os.environ.get("VLLM_ERROR_CONTRIBUTION_REFERENCE_FILE", "")
++
++
++def _mode() -> str:
++    value = os.environ.get("VLLM_ERROR_CONTRIBUTION_MODE", "").strip().lower()
++    if not value:
++        return ""
++    if value not in _MODES:
++        raise ValueError(
++            "VLLM_ERROR_CONTRIBUTION_MODE must be one of "
++            f"{sorted(_MODES)}; got {value!r}"
++        )
++    return value
++
++
++def error_contribution_enabled() -> bool:
++    return bool(_output_file() and _mode())
++
++
++def _stage_enabled(stage: str) -> bool:
++    pattern = os.environ.get("VLLM_ERROR_CONTRIBUTION_STAGE_REGEX", "")
++    if not pattern:
++        return True
++    return re.search(pattern, stage) is not None
++
++
++def _parse_token_indices(
++    value: str | Iterable[int],
++    *,
++    source: str,
++) -> tuple[int, ...]:
++    raw_items = re.split(r"[,;+\s]+", value.strip()) if isinstance(value, str) else value
++    token_indices: list[int] = []
++    seen: set[int] = set()
++    for item in raw_items:
++        if item == "":
++            continue
++        try:
++            index = int(item)
++        except (TypeError, ValueError) as exc:
++            raise ValueError(f"{source} must contain integer row indices") from exc
++        if index < 0:
++            raise ValueError(f"{source} does not support negative indices")
++        if index in seen:
++            continue
++        seen.add(index)
++        token_indices.append(index)
++    return tuple(token_indices)
++
++
++def _expected_rows_from_env() -> int | None:
++    value = os.environ.get("VLLM_ERROR_CONTRIBUTION_EXPECTED_ROWS", "").strip()
++    if not value:
++        return None
++    expected = int(value)
++    if expected <= 0:
++        raise ValueError("VLLM_ERROR_CONTRIBUTION_EXPECTED_ROWS must be positive")
++    return expected
++
++
++def set_error_contribution_token_filter(
++    token_indices: str | Iterable[int] | None,
++    *,
++    expected_rows: int | None = None,
++) -> None:
++    """Set selected row indices for the next traced prefill batch."""
++
++    global _TOKEN_FILTER_OVERRIDE
++    if token_indices is None:
++        _TOKEN_FILTER_OVERRIDE = (False, (), expected_rows)
++        return
++    _TOKEN_FILTER_OVERRIDE = (
++        True,
++        _parse_token_indices(token_indices, source="set_error_contribution_token_filter"),
++        expected_rows,
++    )
++
++
++def clear_error_contribution_token_filter_override() -> None:
++    global _TOKEN_FILTER_OVERRIDE
++    _TOKEN_FILTER_OVERRIDE = None
++
++
++def _token_filter() -> tuple[bool, tuple[int, ...], int | None]:
++    if _TOKEN_FILTER_OVERRIDE is not None:
++        return _TOKEN_FILTER_OVERRIDE
++    if "VLLM_ERROR_CONTRIBUTION_TOKEN_INDICES" in os.environ:
++        return (
++            True,
++            _parse_token_indices(
++                os.environ["VLLM_ERROR_CONTRIBUTION_TOKEN_INDICES"],
++                source="VLLM_ERROR_CONTRIBUTION_TOKEN_INDICES",
++            ),
++            _expected_rows_from_env(),
++        )
++    return False, (), _expected_rows_from_env()
++
++
++def clear_error_contribution_trace() -> None:
++    _TENSORS.clear()
++    _MSE_TENSORS.clear()
++    _PAIR_TENSORS.clear()
++    _CANDIDATE_TENSORS.clear()
++    _INPUT_DIFFS.clear()
++    _POST_DIFFS.clear()
++    _FINAL_NORM_INPUT_DIFFS.clear()
++    _WARNED.clear()
++
++
++def _warn_once(stage: str, reason: str) -> None:
++    key = f"{stage}:{reason}"
++    if key in _WARNED:
++        return
++    _WARNED.add(key)
++    import warnings
++
++    warnings.warn(
++        f"Skipping error-contribution trace for {stage}: {reason}",
++        RuntimeWarning,
++        stacklevel=3,
++    )
++
++
++def _select_rows(stage: str, tensor: torch.Tensor) -> torch.Tensor | None:
++    enabled, token_indices, expected_rows = _token_filter()
++    if expected_rows is not None and (
++        tensor.ndim == 0 or int(tensor.shape[0]) != int(expected_rows)
++    ):
++        return None
++    if _FULL_ROW_STAGE_RE.fullmatch(stage):
++        return tensor
++    if not enabled:
++        return tensor
++    if not token_indices:
++        return None
++    if tensor.ndim == 0:
++        _warn_once(stage, "scalar tensor has no token row dimension")
++        return None
++    valid_indices = [idx for idx in token_indices if idx < tensor.shape[0]]
++    if not valid_indices:
++        return None
++    indices = torch.tensor(valid_indices, dtype=torch.long, device=tensor.device)
++    return tensor.index_select(0, indices)
++
++
++def _to_cpu_float(tensor: torch.Tensor) -> torch.Tensor:
++    if torch.is_floating_point(tensor):
++        tensor = tensor.to(torch.float32)
++    return tensor.detach().cpu().contiguous().clone()
++
++
++def _next_key(stage: str, count: int) -> str:
++    if count == 0:
++        return stage
++    return f"{stage}__chunk_{count:06d}"
++
++
++def _reference_tensor(stage: str, count: int) -> torch.Tensor:
++    path = _reference_file()
++    if not path:
++        raise RuntimeError("candidate mode requires VLLM_ERROR_CONTRIBUTION_REFERENCE_FILE")
++    key = _next_key(stage, count)
++    fallback_key = f"{stage}__chunk_{count:06d}"
++    with safe_open(path, framework="pt", device="cpu") as handle:
++        keys = set(handle.keys())
++        selected_key = key if key in keys else fallback_key
++        if selected_key not in keys:
++            raise KeyError(
++                f"reference tensor {key!r}/{fallback_key!r} not found in {path}"
++            )
++        return handle.get_tensor(selected_key).to(torch.float32)
++
++
++def _record_reference(stage: str, selected: torch.Tensor) -> None:
++    _TENSORS.setdefault(stage, []).append(_to_cpu_float(selected))
++
++
++def _record_candidate_raw(stage: str, selected: torch.Tensor) -> None:
++    _CANDIDATE_TENSORS.setdefault(stage, []).append(_to_cpu_float(selected))
++
++
++@contextmanager
++def _strict_fp32_matmul():
++    old_precision = torch.get_float32_matmul_precision()
++    old_cuda_tf32 = torch.backends.cuda.matmul.allow_tf32
++    old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
++    try:
++        torch.set_float32_matmul_precision("highest")
++        torch.backends.cuda.matmul.allow_tf32 = False
++        torch.backends.cudnn.allow_tf32 = False
++        yield
++    finally:
++        torch.set_float32_matmul_precision(old_precision)
++        torch.backends.cuda.matmul.allow_tf32 = old_cuda_tf32
++        torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
++
++
++def _linear_fp32(layer: object, x: torch.Tensor) -> torch.Tensor:
++    weight = getattr(layer, "weight", None)
++    if weight is None:
++        raise AttributeError(f"{type(layer).__name__} has no weight tensor")
++    bias = getattr(layer, "bias", None)
++    weight_tensor = weight.detach().to(device=x.device, dtype=torch.float32)
++    bias_tensor = None
++    if bias is not None:
++        bias_tensor = bias.detach().to(device=x.device, dtype=torch.float32)
++    return F.linear(x.to(torch.float32), weight_tensor, bias_tensor)
++
++
++def _rmsnorm_fp32(layer: object, x: torch.Tensor) -> torch.Tensor:
++    x_fp32 = x.to(torch.float32)
++    weight = getattr(layer, "weight", None)
++    variance_size_override = getattr(layer, "variance_size_override", None)
++    x_var = x_fp32 if variance_size_override is None else x_fp32[..., :variance_size_override]
++    variance = x_var.pow(2).mean(dim=-1, keepdim=True)
++    eps = float(getattr(layer, "variance_epsilon", getattr(layer, "eps", 1e-6)))
++    output = x_fp32 * torch.rsqrt(variance + eps)
++    if weight is None:
++        return output
++    return output * weight.detach().to(device=x.device, dtype=torch.float32)
++
++
++def record_mlp_block_oracle(name: str, post_attention_layernorm: object,
++                            mlp_module: object,
++                            residual_stream: torch.Tensor) -> None:
++    if not error_contribution_enabled() or _mode() != _CANDIDATE_MODE:
++        return
++    if not _stage_enabled(name):
++        return
++    with torch.no_grad(), _strict_fp32_matmul():
++        x = residual_stream.to(torch.float32)
++        normed = _rmsnorm_fp32(post_attention_layernorm, x)
++        gate_up = _linear_fp32(mlp_module.gate_up_proj, normed)
++        gate, up = gate_up.chunk(2, dim=-1)
++        hidden = F.silu(gate) * up
++        mlp_out = _linear_fp32(mlp_module.down_proj, hidden)
++        record_error_contribution_tensor(name, x + mlp_out)
++
++
++def _row_mean(tensor: torch.Tensor) -> torch.Tensor:
++    if tensor.ndim == 0:
++        return tensor.reshape(1)
++    return tensor.reshape(tensor.shape[0], -1).mean(dim=1)
++
++
++def _pair_statistics(before: torch.Tensor, after: torch.Tensor) -> dict[str, torch.Tensor]:
++    if tuple(before.shape) != tuple(after.shape):
++        raise RuntimeError(
++            f"shape mismatch for paired residual tensors: before {tuple(before.shape)} "
++            f"vs after {tuple(after.shape)}"
++        )
++    delta = after - before
++    before_mse = _row_mean(before.square())
++    mean_product = _row_mean(after * before)
++    cross = mean_product - before_mse
++    stats = {
++        "delta_mse": _row_mean(delta.square()),
++        "before_mse": before_mse,
++        "mean_product": mean_product,
++        "cross": cross,
++        "covariance": cross,
++    }
++    if before.ndim == 0:
++        stats["before_delta_rho"] = torch.zeros(1, dtype=torch.float32)
++    else:
++        before_flat = before.reshape(before.shape[0], -1)
++        delta_flat = delta.reshape(delta.shape[0], -1)
++        denom = before_flat.norm(dim=1) * delta_flat.norm(dim=1)
++        rho = torch.zeros_like(denom)
++        valid = denom > 0
++        rho[valid] = (before_flat[valid] * delta_flat[valid]).sum(dim=1) / denom[valid]
++        stats["before_delta_rho"] = rho
++    if before.ndim == 0:
++        stats["centered_covariance"] = torch.zeros(1, dtype=torch.float32)
++    else:
++        before_flat = before.reshape(before.shape[0], -1)
++        after_flat = after.reshape(after.shape[0], -1)
++        before_centered = before_flat - before_flat.mean(dim=1, keepdim=True)
++        after_centered = after_flat - after_flat.mean(dim=1, keepdim=True)
++        stats["centered_covariance"] = (before_centered * after_centered).mean(dim=1)
++    return {key: value.to(torch.float32).contiguous() for key, value in stats.items()}
++
++
++def _append_pair_stat(kind: str, layer: int | None, metric: str, values: torch.Tensor) -> None:
++    key = f"{kind}.{metric}" if layer is None else f"{kind}.{metric}.{layer}"
++    _PAIR_TENSORS.setdefault(key, []).append(values)
++
++
++def _record_residual_pair(
++    *,
++    kind: str,
++    layer: int | None,
++    before: torch.Tensor,
++    after: torch.Tensor,
++) -> None:
++    for metric, values in _pair_statistics(before, after).items():
++        _append_pair_stat(kind, layer, metric, values)
++
++
++def _record_candidate_pairs(stage: str, chunk_index: int, diff: torch.Tensor) -> None:
++    input_match = _INPUT_STAGE_RE.fullmatch(stage)
++    if input_match is not None:
++        layer = int(input_match.group(1))
++        _INPUT_DIFFS[(layer, chunk_index)] = diff
++        previous_post = _POST_DIFFS.pop((layer - 1, chunk_index), None)
++        if previous_post is not None:
++            _record_residual_pair(
++                kind="mlp",
++                layer=layer - 1,
++                before=previous_post,
++                after=diff,
++            )
++        return
++
++    post_match = _POST_STAGE_RE.fullmatch(stage)
++    if post_match is not None:
++        layer = int(post_match.group(1))
++        input_diff = _INPUT_DIFFS.pop((layer, chunk_index), None)
++        if input_diff is not None:
++            _record_residual_pair(
++                kind="attention",
++                layer=layer,
++                before=input_diff,
++                after=diff,
++            )
++        _POST_DIFFS[(layer, chunk_index)] = diff
++        return
++
++    if stage == "forward.norm.input":
++        _FINAL_NORM_INPUT_DIFFS[chunk_index] = diff
++        pending_posts = [
++            (layer, post_diff)
++            for (layer, stored_chunk), post_diff in _POST_DIFFS.items()
++            if stored_chunk == chunk_index
++        ]
++        if pending_posts:
++            layer, post_diff = max(pending_posts, key=lambda item: item[0])
++            _POST_DIFFS.pop((layer, chunk_index), None)
++            _record_residual_pair(
++                kind="mlp",
++                layer=layer,
++                before=post_diff,
++                after=diff,
++            )
++        return
++
++    if stage == "forward.norm.hidden":
++        norm_input = _FINAL_NORM_INPUT_DIFFS.pop(chunk_index, None)
++        if norm_input is not None:
++            _record_residual_pair(
++                kind="final_norm",
++                layer=None,
++                before=norm_input,
++                after=diff,
++            )
++
++
++def _record_candidate(stage: str, selected: torch.Tensor) -> None:
++    if _RAW_CANDIDATE_STAGE_RE.fullmatch(stage):
++        _record_candidate_raw(stage, selected)
++    if _ORACLE_STAGE_RE.match(stage):
++        return
++
++    chunks = _MSE_TENSORS.setdefault(stage, [])
++    chunk_index = len(chunks)
++    reference = _reference_tensor(stage, chunk_index)
++    candidate = selected.detach().to(torch.float32).cpu()
++    if tuple(candidate.shape) != tuple(reference.shape):
++        raise RuntimeError(
++            f"shape mismatch for {stage}: candidate {tuple(candidate.shape)} "
++            f"vs reference {tuple(reference.shape)}"
++        )
++    diff = candidate - reference
++    if diff.ndim == 0:
++        mse = diff.square().reshape(1)
++    else:
++        mse = diff.square().reshape(diff.shape[0], -1).mean(dim=1)
++    chunks.append(mse.to(torch.float32).contiguous())
++    _record_candidate_pairs(stage, chunk_index, diff)
++
++
++def record_error_contribution_tensor(stage: str, tensor: torch.Tensor) -> torch.Tensor:
++    if not error_contribution_enabled() or not _stage_enabled(stage):
++        return tensor
++    if not torch.is_tensor(tensor):
++        return tensor
++    with torch.no_grad():
++        selected = _select_rows(stage, tensor)
++        if selected is None:
++            return tensor
++        mode = _mode()
++        if mode == _REFERENCE_MODE:
++            _record_reference(stage, selected)
++        elif mode == _CANDIDATE_MODE:
++            _record_candidate(stage, selected)
++    return tensor
++
++
++def _raw_payload_and_metadata() -> tuple[dict[str, torch.Tensor], dict[str, object]]:
++    payload: dict[str, torch.Tensor] = {}
++    metadata: dict[str, object] = {}
++    for stage, chunks in _TENSORS.items():
++        rows = []
++        multiple = len(chunks) > 1
++        for idx, tensor in enumerate(chunks):
++            key = f"{stage}__chunk_{idx:06d}" if multiple else stage
++            payload[key] = tensor
++            rows.append({"key": key, "shape": list(tensor.shape), "dtype": str(tensor.dtype)})
++        metadata[stage] = rows
++    return payload, metadata
++
++
++def _mse_payload() -> dict[str, object]:
++    stages: dict[str, torch.Tensor] = {}
++    metadata: dict[str, object] = {}
++    for stage, chunks in _MSE_TENSORS.items():
++        if not chunks:
++            continue
++        tensor = torch.cat(chunks, dim=0).to(torch.float32).contiguous()
++        stages[stage] = tensor
++        metadata[stage] = {
++            "shape": list(tensor.shape),
++            "dtype": str(tensor.dtype),
++            "chunks": len(chunks),
++        }
++    pairs: dict[str, torch.Tensor] = {}
++    pair_metadata: dict[str, object] = {}
++    for name, chunks in _PAIR_TENSORS.items():
++        if not chunks:
++            continue
++        tensor = torch.cat(chunks, dim=0).to(torch.float32).contiguous()
++        pairs[name] = tensor
++        pair_metadata[name] = {
++            "shape": list(tensor.shape),
++            "dtype": str(tensor.dtype),
++            "chunks": len(chunks),
++        }
++    candidate_tensors: dict[str, torch.Tensor] = {}
++    candidate_metadata: dict[str, object] = {}
++    for stage, chunks in _CANDIDATE_TENSORS.items():
++        if not chunks:
++            continue
++        tensor = torch.cat(chunks, dim=0).to(torch.float32).contiguous()
++        candidate_tensors[stage] = tensor
++        candidate_metadata[stage] = {
++            "shape": list(tensor.shape),
++            "dtype": str(tensor.dtype),
++            "chunks": len(chunks),
++        }
++    return {
++        "schema_version": 3,
++        "mode": _CANDIDATE_MODE,
++        "reference_file": _reference_file(),
++        "stages": stages,
++        "metadata": metadata,
++        "pairs": pairs,
++        "pair_metadata": pair_metadata,
++        "candidate_tensors": candidate_tensors,
++        "candidate_metadata": candidate_metadata,
++    }
++
++
++def flush_error_contribution_trace(
++    output_file: str | os.PathLike[str] | None = None,
++    *,
++    clear: bool = True,
++) -> None:
++    target = str(output_file) if output_file is not None else _output_file()
++    if not target:
++        return
++    path = Path(target)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    mode = _mode()
++    if mode == _REFERENCE_MODE:
++        payload, metadata = _raw_payload_and_metadata()
++        if payload:
++            save_file(payload, str(path))
++            path.with_suffix(path.suffix + ".meta.json").write_text(
++                json.dumps(metadata, indent=2, sort_keys=True) + "\n",
++                encoding="utf-8",
++            )
++    elif mode == _CANDIDATE_MODE and (_MSE_TENSORS or _PAIR_TENSORS or _CANDIDATE_TENSORS):
++        torch.save(_mse_payload(), path)
++    if clear:
++        clear_error_contribution_trace()
+diff --git a/vllm/model_executor/models/heal_runtime.py b/vllm/model_executor/models/heal_runtime.py
+new file mode 100644
+index 000000000..ca5e10cc5
+--- /dev/null
++++ b/vllm/model_executor/models/heal_runtime.py
+@@ -0,0 +1,681 @@
++# SPDX-License-Identifier: Apache-2.0
++"""HEAL precision helpers for local experiments."""
++
++from __future__ import annotations
++
++from contextlib import contextmanager
++import math
++import os
++import re
++
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_FP16_MAX = torch.finfo(torch.float16).max
++
++
++@contextmanager
++def _autocast_disabled_for(tensor: torch.Tensor):
++    device_type = tensor.device.type
++    with torch.amp.autocast(device_type="cpu", enabled=False):
++        if device_type in {"cuda", "xpu", "hpu"}:
++            with torch.amp.autocast(device_type=device_type, enabled=False):
++                yield
++        else:
++            yield
++
++
++_HEAL_MODE_ORDER = {
++    "off": 0,
++    "base": 1,
++    "plus": 2,
++    "full": 3,
++}
++_HEAL_MODE_ALIASES = {
++    "": "off",
++    "0": "off",
++    "false": "off",
++    "no": "off",
++    "none": "off",
++    "off": "off",
++    "1": "full",
++    "true": "full",
++    "yes": "full",
++    "on": "full",
++}
++
++
++def _env_enabled(name: str) -> bool:
++    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
++
++
++def heal_mode() -> str:
++    raw_mode = os.environ.get("HEAL_MODE", "off").strip().lower()
++    mode = _HEAL_MODE_ALIASES.get(raw_mode, raw_mode)
++    if mode not in _HEAL_MODE_ORDER:
++        raise ValueError("HEAL_MODE must be one of: off, base, plus, full.")
++    return mode
++
++
++def _mode_at_least(mode: str) -> bool:
++    return _HEAL_MODE_ORDER[heal_mode()] >= _HEAL_MODE_ORDER[mode]
++
++
++def enabled() -> bool:
++    return heal_mode() != "off"
++
++
++def fp32_output_gemm_enabled() -> bool:
++    return enabled()
++
++
++def fp16_weight_scaling_enabled() -> bool:
++    return fp32_output_gemm_enabled()
++
++
++def int16_v_cache_enabled() -> bool:
++    return _mode_at_least("plus")
++
++
++def int16_k_cache_enabled() -> bool:
++    return _mode_at_least("plus")
++
++
++def int16_q_input_enabled() -> bool:
++    return _mode_at_least("plus")
++
++
++def int16_v_cache_split_fp16_dot_enabled() -> bool:
++    return int16_v_cache_enabled()
++
++
++def q_split_fp16_dot_enabled() -> bool:
++    return _mode_at_least("plus")
++
++
++def fp32_attention_output_enabled() -> bool:
++    return heal_mode() == "plus" or (
++        enabled() and _env_enabled("HEAL_FP32_ATTENTION_OUTPUT")
++    )
++
++
++def int8_gemm_split_enabled() -> bool:
++    return fp32_output_gemm_enabled() and _mode_at_least("full")
++
++
++def dynamic_int8_gemm_weight_enabled() -> bool:
++    return _env_enabled("HEAL_DYNAMIC_INT8_GEMM_WEIGHT")
++
++
++def dynamic_int8_gemm_weight_chunk_rows() -> int:
++    raw = os.environ.get("HEAL_DYNAMIC_INT8_GEMM_WEIGHT_CHUNK_ROWS", "1024")
++    try:
++        rows = int(raw)
++    except ValueError:
++        raise ValueError(
++            "HEAL_DYNAMIC_INT8_GEMM_WEIGHT_CHUNK_ROWS must be a positive integer"
++        ) from None
++    if rows <= 0:
++        raise ValueError(
++            "HEAL_DYNAMIC_INT8_GEMM_WEIGHT_CHUNK_ROWS must be a positive integer"
++        )
++    return rows
++
++
++def _parse_layer_list_env(name: str) -> frozenset[int]:
++    raw = os.environ.get(name, "")
++    layers: set[int] = set()
++    for item in re.split(r"[,;\s]+", raw.strip()):
++        if not item:
++            continue
++        if "-" in item:
++            start_raw, end_raw = item.split("-", 1)
++            try:
++                start = int(start_raw)
++                end = int(end_raw)
++            except ValueError:
++                continue
++            lo, hi = sorted((start, end))
++            layers.update(range(lo, hi + 1))
++            continue
++        try:
++            layers.add(int(item))
++        except ValueError:
++            continue
++    return frozenset(layer for layer in layers if layer >= 0)
++
++
++def _int8_gemm_skip_layers() -> frozenset[int]:
++    return _parse_layer_list_env("HEAL_SKIP_INT8_COMP_LAYERS")
++
++
++def _int16_attention_skip_layers() -> frozenset[int]:
++    return _parse_layer_list_env("HEAL_SKIP_QKV_QUANT_LAYERS")
++
++
++def skip_int16_attention_for_index(layer_idx: int | None) -> bool:
++    if heal_mode() != "plus" or layer_idx is None:
++        return False
++    return int(layer_idx) in _int16_attention_skip_layers()
++
++
++def skip_int8_gemm_split_for_layer(layer: torch.nn.Module) -> bool:
++    cached = getattr(layer, "_heal_skip_int8_gemm_split", None)
++    if cached is not None:
++        return bool(cached)
++    layer_idx = _decoder_layer_index(layer)
++    skipped = layer_idx is not None and layer_idx in _int8_gemm_skip_layers()
++    layer._heal_skip_int8_gemm_split = skipped
++    return skipped
++
++
++def use_int8_gemm_split(layer: torch.nn.Module) -> bool:
++    cached = getattr(layer, "_heal_use_int8_gemm_split", None)
++    if cached is not None:
++        return bool(cached)
++    use_split = (
++        int8_gemm_split_enabled()
++        and use_fp32_output_gemm(layer)
++        and not skip_int8_gemm_split_for_layer(layer)
++    )
++    layer._heal_use_int8_gemm_split = use_split
++    return use_split
++
++
++def configure_attention_module(
++    layer: torch.nn.Module,
++    layer_idx: int | None = None,
++) -> None:
++    """Cache HEAL attention switches before compiled forward runs."""
++
++    if layer_idx is None:
++        layer_idx = _decoder_layer_index(layer)
++    mode = heal_mode()
++    skip_int16_attention = skip_int16_attention_for_index(layer_idx)
++    use_int16_q = int16_q_input_enabled() and not skip_int16_attention
++    use_int16_k = int16_k_cache_enabled() and not skip_int16_attention
++    use_int16_v = int16_v_cache_enabled() and not skip_int16_attention
++
++    layer._heal_enabled = enabled()
++    layer._heal_mode = mode
++    layer._heal_skip_int16_attention = skip_int16_attention
++    layer._heal_fp32_attention_output = fp32_attention_output_enabled()
++    layer._heal_int16_q_input = use_int16_q
++    layer._heal_int16_k_cache = use_int16_k
++    layer._heal_int16_v_cache = use_int16_v
++    layer._heal_q_split_fp16_dot = q_split_fp16_dot_enabled()
++    layer._heal_int16_v_cache_split_fp16_dot = (
++        use_int16_v and int16_v_cache_split_fp16_dot_enabled()
++    )
++
++
++def skip_int16_attention_for_layer(layer: torch.nn.Module) -> bool:
++    cached = getattr(layer, "_heal_skip_int16_attention", None)
++    if cached is not None:
++        return bool(cached)
++    layer_idx = _decoder_layer_index(layer)
++    return skip_int16_attention_for_index(layer_idx)
++
++
++def int16_q_input_enabled_for_layer(layer: torch.nn.Module) -> bool:
++    cached = getattr(layer, "_heal_int16_q_input", None)
++    if cached is not None:
++        return bool(cached)
++    return int16_q_input_enabled() and not skip_int16_attention_for_layer(layer)
++
++
++def int16_k_cache_enabled_for_layer(layer: torch.nn.Module) -> bool:
++    cached = getattr(layer, "_heal_int16_k_cache", None)
++    if cached is not None:
++        return bool(cached)
++    return int16_k_cache_enabled() and not skip_int16_attention_for_layer(layer)
++
++
++def int16_v_cache_enabled_for_layer(layer: torch.nn.Module) -> bool:
++    cached = getattr(layer, "_heal_int16_v_cache", None)
++    if cached is not None:
++        return bool(cached)
++    return int16_v_cache_enabled() and not skip_int16_attention_for_layer(layer)
++
++
++def int16_v_cache_split_fp16_dot_enabled_for_layer(
++    layer: torch.nn.Module,
++) -> bool:
++    cached = getattr(layer, "_heal_int16_v_cache_split_fp16_dot", None)
++    if cached is not None:
++        return bool(cached)
++    return int16_v_cache_enabled_for_layer(
++        layer
++    ) and int16_v_cache_split_fp16_dot_enabled()
++
++
++def q_split_fp16_dot_enabled_for_layer(layer: torch.nn.Module) -> bool:
++    cached = getattr(layer, "_heal_q_split_fp16_dot", None)
++    if cached is not None:
++        return bool(cached)
++    return q_split_fp16_dot_enabled()
++
++
++def keep_bf16_norm_weight() -> bool:
++    return enabled()
++
++
++def keep_bf16_gemm_bias(layer: torch.nn.Module) -> bool:
++    return fp32_output_gemm_enabled() and use_fp32_output_gemm(layer)
++
++
++def _decoder_layer_index(layer: torch.nn.Module) -> int | None:
++    prefix = getattr(layer, "prefix", "")
++    parts = str(prefix).split(".")
++    for marker in ("layers", "h"):
++        if marker not in parts:
++            continue
++        index_pos = parts.index(marker) + 1
++        if index_pos < len(parts) and parts[index_pos].isdigit():
++            return int(parts[index_pos])
++    return None
++
++
++def _is_logits_layer(layer: torch.nn.Module) -> bool:
++    return layer.__class__.__name__ == "ParallelLMHead"
++
++
++def decoder_layer_fp32_output_gemm_enabled(layer: torch.nn.Module) -> bool:
++    if not fp32_output_gemm_enabled():
++        return False
++    return _decoder_layer_index(layer) is not None
++
++
++def logits_fp32_output_gemm_enabled(layer: torch.nn.Module) -> bool:
++    return fp32_output_gemm_enabled() and _is_logits_layer(layer)
++
++
++def use_fp32_output_gemm(layer: torch.nn.Module) -> bool:
++    if not fp32_output_gemm_enabled():
++        return False
++    if _is_logits_layer(layer):
++        return logits_fp32_output_gemm_enabled(layer)
++    return decoder_layer_fp32_output_gemm_enabled(layer)
++
++
++def _loaded_weight_scale_exponent(loaded_weight: torch.Tensor) -> int | None:
++    if loaded_weight.numel() == 0:
++        return None
++    max_abs = float(loaded_weight.detach().abs().max().to(torch.float32).item())
++    if not math.isfinite(max_abs):
++        raise ValueError("HEAL weight scaling requires finite loaded weights.")
++    if max_abs <= 0.0:
++        return None
++    return math.floor(math.log2(_FP16_MAX / max_abs))
++
++
++def _scale_loaded_weight(loaded_weight: torch.Tensor, exponent: int) -> torch.Tensor:
++    return loaded_weight.to(torch.float32).mul(math.ldexp(1.0, exponent))
++
++
++def _report_gemm_weight_scale_loss(
++    layer: torch.nn.Module,
++    param: torch.Tensor,
++    loaded_weight: torch.Tensor,
++    prepared: torch.Tensor,
++    scale: float,
++    exponent: int,
++) -> None:
++    ref = loaded_weight.detach().to(torch.float32)
++    prepared_view = prepared.detach().reshape_as(ref)
++    flat_ref = ref.reshape(-1, ref.shape[-1])
++    flat_prepared = prepared_view.reshape_as(flat_ref)
++    rows = flat_ref.shape[0]
++    if rows == 0:
++        return
++
++    sq_sum = 0.0
++    count = 0
++    max_abs = 0.0
++    max_abs_index = 0
++    max_row_mse = -1.0
++    max_row = 0
++    width = flat_ref.shape[-1]
++    chunk_rows = 1024
++    for start in range(0, rows, chunk_rows):
++        end = min(start + chunk_rows, rows)
++        with _autocast_disabled_for(flat_prepared):
++            reconstructed = flat_prepared[start:end].to(param.dtype).to(torch.float32)
++            reconstructed = reconstructed / scale
++            diff = reconstructed - flat_ref[start:end]
++            sq = diff.square()
++            row_sq = sq.sum(dim=-1)
++        row_mse = row_sq / width
++        chunk_max, chunk_idx = row_mse.max(dim=0)
++        chunk_max_value = float(chunk_max.item())
++        if chunk_max_value > max_row_mse:
++            max_row_mse = chunk_max_value
++            max_row = start + int(chunk_idx.item())
++        sq_sum += float(row_sq.sum().item())
++        count += diff.numel()
++        if diff.numel():
++            abs_diff = diff.abs().reshape(-1)
++            chunk_abs, chunk_abs_idx = abs_diff.max(dim=0)
++            chunk_abs_value = float(chunk_abs.item())
++            if chunk_abs_value > max_abs:
++                max_abs = chunk_abs_value
++                max_abs_index = start * width + int(chunk_abs_idx.item())
++
++    layer_name = getattr(layer, "prefix", "") or layer.__class__.__name__
++    logger.info(
++        "HEAL GEMM scaled-FP16 load loss: layer=%s rows=%d cols=%d "
++        "max_row_mse=%.6e max_row=%d global_mse=%.6e "
++        "max_abs=%.6e max_abs_index=%d exponent=%d scale=%.6e",
++        layer_name,
++        rows,
++        width,
++        max_row_mse,
++        max_row,
++        sq_sum / count if count else 0.0,
++        max_abs,
++        max_abs_index,
++        exponent,
++        scale,
++    )
++
++
++def _token_embedding_scale(
++    loaded_weight: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    with _autocast_disabled_for(loaded_weight):
++        loaded_fp32 = loaded_weight.detach().to(torch.float32)
++        flat = loaded_fp32.reshape(-1, loaded_fp32.shape[-1])
++        max_abs = flat.abs().amax(dim=-1).to(torch.float32)
++        if not bool(torch.isfinite(max_abs).all().item()):
++            raise ValueError("HEAL token embedding scaling requires finite weights.")
++
++        exponents = torch.zeros(
++            max_abs.shape, dtype=torch.int32, device=max_abs.device
++        )
++        positive = max_abs > 0
++        if bool(positive.any().item()):
++            fp16_max = torch.tensor(
++                _FP16_MAX, dtype=torch.float32, device=max_abs.device
++            )
++            exponent_values = torch.floor(torch.log2(fp16_max / max_abs[positive]))
++            # Keep the scale itself representable while preserving the practical
++            # "scale up to FP16 range" behavior for normal model weights.
++            exponent_values = exponent_values.clamp(min=-120, max=120)
++            exponents[positive] = exponent_values.to(torch.int32)
++        exponents_cpu = exponents.cpu()
++        scale_cpu = torch.empty(max_abs.shape, dtype=torch.float32)
++        for exponent in torch.unique(exponents_cpu).tolist():
++            exponent_int = int(exponent)
++            scale_cpu[exponents_cpu == exponent_int] = math.ldexp(1.0, exponent_int)
++        scale = scale_cpu.to(device=max_abs.device, dtype=torch.float32)
++        return loaded_fp32, exponents, scale
++
++
++def _report_token_embedding_scale_loss(
++    layer: torch.nn.Module,
++    param: torch.Tensor,
++    loaded_fp32: torch.Tensor,
++    prepared: torch.Tensor,
++    scale: torch.Tensor,
++    exponents: torch.Tensor,
++) -> None:
++    flat_ref = loaded_fp32.reshape(-1, loaded_fp32.shape[-1])
++    flat_prepared = prepared.reshape_as(flat_ref)
++    rows = flat_ref.shape[0]
++    if rows == 0:
++        return
++
++    sq_sum = 0.0
++    count = 0
++    max_abs = 0.0
++    max_token_mse = -1.0
++    max_token_row = 0
++    chunk_rows = 1024
++    for start in range(0, rows, chunk_rows):
++        end = min(start + chunk_rows, rows)
++        with _autocast_disabled_for(flat_prepared):
++            scale_chunk = scale[start:end].reshape(-1, 1).to(torch.float32)
++            reconstructed = flat_prepared[start:end].to(param.dtype).to(torch.float32)
++            reconstructed = reconstructed / scale_chunk
++            diff = reconstructed - flat_ref[start:end]
++            row_sq = diff.square().sum(dim=-1)
++        row_mse = row_sq / diff.shape[-1]
++        chunk_max, chunk_idx = row_mse.max(dim=0)
++        chunk_max_value = float(chunk_max.item())
++        if chunk_max_value > max_token_mse:
++            max_token_mse = chunk_max_value
++            max_token_row = start + int(chunk_idx.item())
++        sq_sum += float(row_sq.sum().item())
++        count += diff.numel()
++        if diff.numel():
++            max_abs = max(max_abs, float(diff.abs().max().item()))
++
++    layer_name = getattr(layer, "prefix", "") or layer.__class__.__name__
++    logger.info(
++        "HEAL token embedding scaled-FP16 load loss: layer=%s rows=%d "
++        "hidden=%d max_token_mse=%.6e max_token_row=%d global_mse=%.6e "
++        "max_abs=%.6e exponent_min=%d exponent_max=%d",
++        layer_name,
++        rows,
++        flat_ref.shape[-1],
++        max_token_mse,
++        max_token_row,
++        sq_sum / count if count else 0.0,
++        max_abs,
++        int(exponents.min().item()),
++        int(exponents.max().item()),
++    )
++
++
++def prepare_token_embedding_weight(
++    layer: torch.nn.Module,
++    param: torch.Tensor,
++    loaded_weight: torch.Tensor,
++    *,
++    target_offset: int = 0,
++) -> torch.Tensor:
++    if (
++        not enabled()
++        or layer.__class__.__name__ != "VocabParallelEmbedding"
++        or not torch.is_floating_point(loaded_weight)
++        or param.dtype != torch.float16
++        or param.dim() < 2
++        or loaded_weight.dim() < 2
++    ):
++        return loaded_weight
++
++    with _autocast_disabled_for(loaded_weight):
++        loaded_fp32, exponents, scale = _token_embedding_scale(loaded_weight)
++        prepared = (
++            loaded_fp32.reshape(-1, loaded_fp32.shape[-1])
++            * scale.reshape(-1, 1)
++        ).reshape_as(loaded_fp32)
++
++    scale_cache = getattr(layer, "_heal_token_embedding_scale", None)
++    expected_shape = (param.shape[0],)
++    if (
++        scale_cache is None
++        or tuple(scale_cache.shape) != expected_shape
++        or scale_cache.device != param.device
++    ):
++        _set_nonpersistent_buffer(
++            layer,
++            "_heal_token_embedding_scale",
++            torch.ones(expected_shape, dtype=torch.float32, device=param.device),
++        )
++        scale_cache = getattr(layer, "_heal_token_embedding_scale")
++    scale_cache.narrow(0, target_offset, scale.numel()).copy_(
++        scale.to(device=param.device, dtype=torch.float32)
++    )
++
++    _report_token_embedding_scale_loss(
++        layer, param, loaded_fp32, prepared, scale, exponents
++    )
++    return prepared
++
++
++def prepare_loaded_weight(
++    layer: torch.nn.Module,
++    param: torch.Tensor,
++    loaded_weight: torch.Tensor,
++) -> torch.Tensor:
++    skip_int8_gemm_split_for_layer(layer)
++    if (
++        not fp16_weight_scaling_enabled()
++        or not use_fp32_output_gemm(layer)
++        or not torch.is_floating_point(loaded_weight)
++        or param.dtype != torch.float16
++        or param.dim() < 2
++        or loaded_weight.dim() < 2
++    ):
++        return loaded_weight
++
++    candidate_exponent = _loaded_weight_scale_exponent(loaded_weight)
++    if candidate_exponent is None:
++        return loaded_weight
++
++    current_exponent = getattr(layer, "_heal_weight_scale_exponent", None)
++    if current_exponent is None:
++        exponent = candidate_exponent
++    else:
++        exponent = min(int(current_exponent), candidate_exponent)
++        if exponent != int(current_exponent):
++            param.data.mul_(math.ldexp(1.0, exponent - int(current_exponent)))
++
++    scale = math.ldexp(1.0, exponent)
++    layer._heal_weight_scale_exponent = exponent
++    layer._heal_weight_output_scale = scale
++    prepared = _scale_loaded_weight(loaded_weight, exponent)
++    _report_gemm_weight_scale_loss(
++        layer, param, loaded_weight, prepared, scale, exponent
++    )
++    return prepared
++
++
++def weight_output_scale(layer: torch.nn.Module) -> float | None:
++    scale = getattr(layer, "_heal_weight_output_scale", None)
++    if scale is None:
++        return None
++    return float(scale)
++
++
++def _set_nonpersistent_buffer(
++    layer: torch.nn.Module,
++    name: str,
++    value: torch.Tensor,
++) -> None:
++    if name in layer._buffers:
++        layer._buffers[name] = value
++    else:
++        layer.register_buffer(name, value, persistent=False)
++
++
++def _clear_int8_gemm_weight(layer: torch.nn.Module) -> None:
++    for name in ("_heal_int8_gemm_weight_t", "_heal_int8_gemm_weight_scale"):
++        if name in getattr(layer, "_buffers", {}):
++            layer._buffers.pop(name, None)
++        elif hasattr(layer, name):
++            delattr(layer, name)
++
++
++@torch.no_grad()
++def prepare_int8_gemm_weight(layer: torch.nn.Module) -> None:
++    if not use_int8_gemm_split(layer):
++        _clear_int8_gemm_weight(layer)
++        return
++    if dynamic_int8_gemm_weight_enabled():
++        _clear_int8_gemm_weight(layer)
++        return
++    weight = getattr(layer, "weight", None)
++    if (
++        weight is None
++        or not torch.is_floating_point(weight)
++        or weight.dim() != 2
++        or weight.numel() == 0
++    ):
++        return
++
++    weight_fp32 = weight.detach().to(torch.float32)
++    scale = weight_fp32.abs().amax(dim=1)
++    scale = scale.clamp_min(torch.finfo(torch.float32).tiny).div(127.0)
++    q_weight = torch.round(weight_fp32 / scale[:, None]).clamp_(-127, 127)
++    q_weight = q_weight.to(torch.int8).contiguous()
++
++    _set_nonpersistent_buffer(
++        layer,
++        "_heal_int8_gemm_weight_t",
++        q_weight.t(),
++    )
++    _set_nonpersistent_buffer(
++        layer,
++        "_heal_int8_gemm_weight_scale",
++        scale.contiguous(),
++    )
++
++
++def fp32_stream_enabled() -> bool:
++    return enabled()
++
++
++def main_stream(
++    x: torch.Tensor | None,
++    active: bool | None = None,
++) -> torch.Tensor | None:
++    if active is None:
++        active = enabled()
++    if x is None or not active or not torch.is_floating_point(x):
++        return x
++    return x if x.dtype == torch.float32 else x.to(torch.float32)
++
++
++def gemm_input(
++    x: torch.Tensor,
++    target_dtype: torch.dtype,
++    active: bool | None = None,
++) -> torch.Tensor:
++    if active is None:
++        active = enabled()
++    if not active or not torch.is_floating_point(x):
++        return x
++    return x if x.dtype == target_dtype else x.to(target_dtype)
++
++
++def attention_inputs(
++    attn_module: torch.nn.Module,
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    heal_enabled = getattr(attn_module, "_heal_enabled", None)
++    if heal_enabled is None:
++        heal_enabled = enabled()
++    if not heal_enabled:
++        return q, k, v
++    target_dtype = getattr(getattr(attn_module, "qkv_proj", None), "weight", q).dtype
++    use_int16_q = int16_q_input_enabled_for_layer(attn_module)
++    use_int16_k = int16_k_cache_enabled_for_layer(attn_module)
++    use_int16_v = int16_v_cache_enabled_for_layer(attn_module)
++    use_q_split = q_split_fp16_dot_enabled_for_layer(attn_module)
++    if use_int16_q or use_int16_k or use_int16_v:
++        q_input = (
++            main_stream(q, heal_enabled)
++            if use_int16_q and use_q_split
++            else gemm_input(q, target_dtype, heal_enabled)
++        )
++        return (
++            q_input,
++            main_stream(k, heal_enabled) if use_int16_k else gemm_input(
++                k, target_dtype, heal_enabled
++            ),
++            main_stream(v, heal_enabled) if use_int16_v else gemm_input(
++                v, target_dtype, heal_enabled
++            ),
++        )
++    return (
++        gemm_input(q, target_dtype, heal_enabled),
++        gemm_input(k, target_dtype, heal_enabled),
++        gemm_input(v, target_dtype, heal_enabled),
++    )
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 2ecced3df..ba23d19b6 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -60,6 +60,13 @@ from vllm.sequence import IntermediateTensors
+ from vllm.v1.attention.backend import AttentionType
+ 
+ from .adapters import as_embedding_model, as_seq_cls_model
++from .heal_runtime import attention_inputs as heal_attention_inputs
++from .heal_runtime import configure_attention_module as configure_heal_attention
++from .heal_runtime import main_stream as heal_main_stream
++from .error_contribution_trace import (
++    record_error_contribution_tensor as _trace_error_contribution,
++    record_mlp_block_oracle as _trace_mlp_block_oracle,
++)
+ from .interfaces import (
+     EagleModelMixin,
+     SupportsEagle,
+@@ -67,6 +74,7 @@ from .interfaces import (
+     SupportsLoRA,
+     SupportsPP,
+ )
++from .tensor_trace import record_tensor_trace_tensor as prt
+ from .utils import (
+     AutoWeightsLoader,
+     PPMissingLayer,
+@@ -138,6 +146,8 @@ class LlamaAttention(nn.Module):
+     ) -> None:
+         super().__init__()
+         layer_idx = extract_layer_index(prefix)
++        self.layer_idx = layer_idx
++        configure_heal_attention(self, layer_idx)
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -228,7 +238,25 @@ class LlamaAttention(nn.Module):
+         qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         q, k = self.rotary_emb(positions, q, k)
++        q, k, v = heal_attention_inputs(self, q, k, v)
++        _trace_error_contribution(
++            f"attention.q.{self.layer_idx}",
++            q.view(-1, self.num_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.k_full.{self.layer_idx}",
++            k.view(-1, self.num_kv_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.v_full.{self.layer_idx}",
++            v.view(-1, self.num_kv_heads, self.head_dim),
++        )
+         attn_output = self.attn(q, k, v)
++        attn_output = heal_main_stream(attn_output)
++        _trace_error_contribution(
++            f"attention.core_output.{self.layer_idx}",
++            attn_output.view(-1, self.num_heads, self.head_dim),
++        )
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
+@@ -312,6 +340,7 @@ class LlamaDecoderLayer(nn.Module):
+         self.post_attention_layernorm = RMSNorm(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
++        self.layer_idx = extract_layer_index(prefix)
+ 
+     def forward(
+         self,
+@@ -320,16 +349,31 @@ class LlamaDecoderLayer(nn.Module):
+         residual: torch.Tensor | None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         # Self Attention
++        layer = self.layer_idx
+         if residual is None:
+             residual = hidden_states
+             hidden_states = self.input_layernorm(hidden_states)
+         else:
+             hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.input_layernorm.output.residual", residual
++        )
+         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.post_attention_layernorm.output.residual", residual
++        )
++        _trace_error_contribution(f"block.mlp.input.{layer}", residual)
++        _trace_mlp_block_oracle(
++            f"oracle.block.mlp.output.{layer}",
++            self.post_attention_layernorm,
++            self.mlp,
++            residual,
++        )
+         hidden_states = self.mlp(hidden_states)
++        _trace_error_contribution(f"block.mlp.output.{layer}", hidden_states + residual)
+         return hidden_states, residual
+ 
+     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
+@@ -416,6 +460,8 @@ class LlamaModel(nn.Module, EagleModelMixin):
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
++        hidden_states = heal_main_stream(hidden_states)
++        residual = heal_main_stream(residual)
+         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+         for idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer)
+@@ -432,7 +478,11 @@ class LlamaModel(nn.Module, EagleModelMixin):
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
+ 
++        _final_norm_input = hidden_states if residual is None else hidden_states + residual
++        _trace_error_contribution("forward.norm.input", _final_norm_input)
+         hidden_states, _ = self.norm(hidden_states, residual)
++        hidden_states = prt("forward.norm.hidden", hidden_states)
++        _trace_error_contribution("forward.norm.hidden", hidden_states)
+ 
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 27aa6175b..e504ac9b0 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -62,6 +62,13 @@ from vllm.sequence import IntermediateTensors
+ from vllm.transformers_utils.config import is_interleaved, set_default_rope_theta
+ from vllm.v1.attention.backend import AttentionType
+ 
++from .heal_runtime import attention_inputs as heal_attention_inputs
++from .heal_runtime import configure_attention_module as configure_heal_attention
++from .heal_runtime import main_stream as heal_main_stream
++from .error_contribution_trace import (
++    record_error_contribution_tensor as _trace_error_contribution,
++    record_mlp_block_oracle as _trace_mlp_block_oracle,
++)
+ from .interfaces import (
+     EagleModelMixin,
+     SupportsEagle,
+@@ -69,6 +76,7 @@ from .interfaces import (
+     SupportsLoRA,
+     SupportsPP,
+ )
++from .tensor_trace import record_tensor_trace_tensor as prt
+ from .utils import (
+     AutoWeightsLoader,
+     PPMissingLayer,
+@@ -134,6 +142,9 @@ class Qwen2Attention(nn.Module):
+         rms_norm_eps: float = 1e-6,
+     ) -> None:
+         super().__init__()
++        layer_idx = extract_layer_index(prefix)
++        self.layer_idx = layer_idx
++        configure_heal_attention(self, layer_idx)
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -199,7 +210,7 @@ class Qwen2Attention(nn.Module):
+             attn_type=attn_type,
+             prefix=f"{prefix}.attn",
+             **{
+-                "layer_idx": extract_layer_index(prefix),
++                "layer_idx": layer_idx,
+                 "dual_chunk_attention_config": dual_chunk_attention_config,
+             }
+             if dual_chunk_attention_config
+@@ -231,7 +242,25 @@ class Qwen2Attention(nn.Module):
+             k = k.view(total_tokens, self.kv_size)
+ 
+         q, k = self.rotary_emb(positions, q, k)
++        q, k, v = heal_attention_inputs(self, q, k, v)
++        _trace_error_contribution(
++            f"attention.q.{self.layer_idx}",
++            q.view(-1, self.num_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.k_full.{self.layer_idx}",
++            k.view(-1, self.num_kv_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.v_full.{self.layer_idx}",
++            v.view(-1, self.num_kv_heads, self.head_dim),
++        )
+         attn_output = self.attn(q, k, v)
++        attn_output = heal_main_stream(attn_output)
++        _trace_error_contribution(
++            f"attention.core_output.{self.layer_idx}",
++            attn_output.view(-1, self.num_heads, self.head_dim),
++        )
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
+@@ -288,6 +317,7 @@ class Qwen2DecoderLayer(nn.Module):
+         self.post_attention_layernorm = RMSNorm(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
++        self.layer_idx = extract_layer_index(prefix)
+ 
+     def forward(
+         self,
+@@ -296,11 +326,15 @@ class Qwen2DecoderLayer(nn.Module):
+         residual: torch.Tensor | None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         # Self Attention
++        layer = self.layer_idx
+         if residual is None:
+             residual = hidden_states
+             hidden_states = self.input_layernorm(hidden_states)
+         else:
+             hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.input_layernorm.output.residual", residual
++        )
+         hidden_states = self.self_attn(
+             positions=positions,
+             hidden_states=hidden_states,
+@@ -308,7 +342,18 @@ class Qwen2DecoderLayer(nn.Module):
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.post_attention_layernorm.output.residual", residual
++        )
++        _trace_error_contribution(f"block.mlp.input.{layer}", residual)
++        _trace_mlp_block_oracle(
++            f"oracle.block.mlp.output.{layer}",
++            self.post_attention_layernorm,
++            self.mlp,
++            residual,
++        )
+         hidden_states = self.mlp(hidden_states)
++        _trace_error_contribution(f"block.mlp.output.{layer}", hidden_states + residual)
+         return hidden_states, residual
+ 
+ 
+@@ -437,6 +482,8 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+ 
++        hidden_states = heal_main_stream(hidden_states)
++        residual = heal_main_stream(residual)
+         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+         for idx, layer in enumerate(
+             islice(self.layers, self.start_layer, self.end_layer)
+@@ -451,7 +498,11 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
+ 
++        _final_norm_input = hidden_states if residual is None else hidden_states + residual
++        _trace_error_contribution("forward.norm.input", _final_norm_input)
+         hidden_states, _ = self.norm(hidden_states, residual)
++        hidden_states = prt("forward.norm.hidden", hidden_states)
++        _trace_error_contribution("forward.norm.hidden", hidden_states)
+ 
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+diff --git a/vllm/model_executor/models/qwen3.py b/vllm/model_executor/models/qwen3.py
+index 91931f9f4..408df3faa 100644
+--- a/vllm/model_executor/models/qwen3.py
++++ b/vllm/model_executor/models/qwen3.py
+@@ -48,6 +48,13 @@ from vllm.sequence import IntermediateTensors
+ from vllm.transformers_utils.config import set_default_rope_theta
+ from vllm.v1.attention.backend import AttentionType
+ 
++from .heal_runtime import attention_inputs as heal_attention_inputs
++from .heal_runtime import configure_attention_module as configure_heal_attention
++from .heal_runtime import main_stream as heal_main_stream
++from .error_contribution_trace import (
++    record_error_contribution_tensor as _trace_error_contribution,
++    record_mlp_block_oracle as _trace_mlp_block_oracle,
++)
+ from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
+ from .qwen2 import Qwen2MLP as Qwen3MLP
+ from .qwen2 import Qwen2Model
+@@ -74,6 +81,9 @@ class Qwen3Attention(nn.Module):
+         dual_chunk_attention_config: dict[str, Any] | None = None,
+     ) -> None:
+         super().__init__()
++        layer_idx = extract_layer_index(prefix)
++        self.layer_idx = layer_idx
++        configure_heal_attention(self, layer_idx)
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -133,7 +143,7 @@ class Qwen3Attention(nn.Module):
+             prefix=f"{prefix}.attn",
+             attn_type=attn_type,
+             **{
+-                "layer_idx": extract_layer_index(prefix),
++                "layer_idx": layer_idx,
+                 "dual_chunk_attention_config": dual_chunk_attention_config,
+             }
+             if dual_chunk_attention_config
+@@ -157,7 +167,25 @@ class Qwen3Attention(nn.Module):
+         k_by_head = self.k_norm(k_by_head)
+         k = k_by_head.view(k.shape)
+         q, k = self.rotary_emb(positions, q, k)
++        q, k, v = heal_attention_inputs(self, q, k, v)
++        _trace_error_contribution(
++            f"attention.q.{self.layer_idx}",
++            q.view(-1, self.num_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.k_full.{self.layer_idx}",
++            k.view(-1, self.num_kv_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.v_full.{self.layer_idx}",
++            v.view(-1, self.num_kv_heads, self.head_dim),
++        )
+         attn_output = self.attn(q, k, v)
++        attn_output = heal_main_stream(attn_output)
++        _trace_error_contribution(
++            f"attention.core_output.{self.layer_idx}",
++            attn_output.view(-1, self.num_heads, self.head_dim),
++        )
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
+@@ -212,6 +240,7 @@ class Qwen3DecoderLayer(nn.Module):
+         self.post_attention_layernorm = RMSNorm(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
++        self.layer_idx = extract_layer_index(prefix)
+ 
+     def forward(
+         self,
+@@ -220,11 +249,15 @@ class Qwen3DecoderLayer(nn.Module):
+         residual: torch.Tensor | None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         # Self Attention
++        layer = self.layer_idx
+         if residual is None:
+             residual = hidden_states
+             hidden_states = self.input_layernorm(hidden_states)
+         else:
+             hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.input_layernorm.output.residual", residual
++        )
+         hidden_states = self.self_attn(
+             positions=positions,
+             hidden_states=hidden_states,
+@@ -232,7 +265,18 @@ class Qwen3DecoderLayer(nn.Module):
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.post_attention_layernorm.output.residual", residual
++        )
++        _trace_error_contribution(f"block.mlp.input.{layer}", residual)
++        _trace_mlp_block_oracle(
++            f"oracle.block.mlp.output.{layer}",
++            self.post_attention_layernorm,
++            self.mlp,
++            residual,
++        )
+         hidden_states = self.mlp(hidden_states)
++        _trace_error_contribution(f"block.mlp.output.{layer}", hidden_states + residual)
+         return hidden_states, residual
+ 
+ 
+diff --git a/vllm/model_executor/models/tensor_trace.py b/vllm/model_executor/models/tensor_trace.py
+new file mode 100644
+index 000000000..132b53496
+--- /dev/null
++++ b/vllm/model_executor/models/tensor_trace.py
+@@ -0,0 +1,141 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Small env-gated tensor tracing hooks for local precision benchmarks."""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++from pathlib import Path
++from typing import Any
++
++import torch
++from safetensors.torch import save_file
++
++_TENSORS: dict[str, list[torch.Tensor]] = {}
++_TENSOR_METADATA: dict[str, list[dict[str, object]]] = {}
++_ROW_METADATA: dict[str, object] | None = None
++_ROW_METADATA_LIST_KEYS = {
++    "row_request_indices",
++    "row_token_positions",
++    "row_token_ids",
++}
++
++
++def _tensor_file() -> str:
++    return os.environ.get("TENSOR_TRACE_TENSOR_FILE") or os.environ.get(
++        "VLLM_TENSOR_TRACE_TENSOR_FILE", ""
++    )
++
++
++def tensor_trace_enabled() -> bool:
++    return bool(_tensor_file())
++
++
++def _stage_enabled(stage: str) -> bool:
++    pattern = os.environ.get("TENSOR_TRACE_STAGE_REGEX") or os.environ.get(
++        "VLLM_TENSOR_TRACE_STAGE_REGEX", ""
++    )
++    if not pattern:
++        return True
++    return re.search(pattern, stage) is not None
++
++
++def set_tensor_trace_row_metadata(metadata: dict[str, Any] | None) -> None:
++    global _ROW_METADATA
++    _ROW_METADATA = dict(metadata) if metadata is not None else None
++
++
++def clear_tensor_trace_row_metadata() -> None:
++    global _ROW_METADATA
++    _ROW_METADATA = None
++
++
++def clear_tensor_trace_tensors() -> None:
++    _TENSORS.clear()
++    _TENSOR_METADATA.clear()
++    clear_tensor_trace_row_metadata()
++
++
++def _row_metadata_for_tensor(row_count: int) -> dict[str, object] | None:
++    if _ROW_METADATA is None:
++        return None
++    metadata: dict[str, object] = {}
++    for key, value in _ROW_METADATA.items():
++        if key not in _ROW_METADATA_LIST_KEYS:
++            metadata[key] = value
++            continue
++        if not isinstance(value, list):
++            metadata[key] = value
++            continue
++        metadata[key] = value[:row_count]
++        if len(value) < row_count:
++            metadata.setdefault("metadata_row_mismatches", []).append(
++                {
++                    "key": key,
++                    "available_rows": len(value),
++                    "tensor_rows": row_count,
++                }
++            )
++    metadata["row_count"] = int(row_count)
++    return metadata
++
++
++def record_tensor_trace_tensor(stage: str, tensor: torch.Tensor) -> torch.Tensor:
++    if not tensor_trace_enabled() or not _stage_enabled(stage):
++        return tensor
++    if not torch.is_tensor(tensor):
++        return tensor
++    with torch.no_grad():
++        captured = tensor.detach()
++        if torch.is_floating_point(captured):
++            captured = captured.to(torch.float32)
++        captured = captured.cpu().contiguous().clone()
++    _TENSORS.setdefault(stage, []).append(captured)
++    if captured.ndim >= 1:
++        row_metadata = _row_metadata_for_tensor(int(captured.shape[0]))
++        if row_metadata is not None:
++            _TENSOR_METADATA.setdefault(stage, []).append(row_metadata)
++    return tensor
++
++
++def _payload_and_metadata() -> tuple[dict[str, torch.Tensor], dict[str, object]]:
++    payload: dict[str, torch.Tensor] = {}
++    metadata: dict[str, object] = {}
++    for stage, chunks in _TENSORS.items():
++        stage_rows = []
++        stage_row_metadata = _TENSOR_METADATA.get(stage, [])
++        for idx, tensor in enumerate(chunks):
++            key = f"{stage}__chunk_{idx:06d}" if len(chunks) > 1 else stage
++            payload[key] = tensor
++            row = {
++                "key": key,
++                "shape": list(tensor.shape),
++                "dtype": str(tensor.dtype),
++            }
++            if idx < len(stage_row_metadata):
++                row["row_metadata"] = stage_row_metadata[idx]
++            stage_rows.append(row)
++        metadata[stage] = stage_rows
++    return payload, metadata
++
++
++def flush_tensor_trace_tensors(
++    tensor_file: str | os.PathLike[str] | None = None,
++    *,
++    clear: bool = True,
++) -> None:
++    target = str(tensor_file) if tensor_file is not None else _tensor_file()
++    if not target:
++        return
++    payload, metadata = _payload_and_metadata()
++    if payload:
++        path = Path(target)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        save_file(payload, str(path))
++        path.with_suffix(path.suffix + ".meta.json").write_text(
++            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
++            encoding="utf-8",
++        )
++    if clear:
++        clear_tensor_trace_tensors()
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 6d967b515..37c7a82c8 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -15,6 +15,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
+     QuantKey,
+     kFp8StaticTensorSym,
+ )
++from vllm.model_executor.models.heal_runtime import (
++    int16_k_cache_enabled_for_layer,
++    int16_v_cache_enabled_for_layer,
++)
+ from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils.math_utils import next_power_of_2
+@@ -32,6 +36,10 @@ from vllm.v1.attention.ops.triton_prefill_attention import context_attention_fwd
+ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+     triton_reshape_and_cache_flash,
+ )
++from vllm.v1.attention.ops.triton_int16_v_cache import (
++    triton_reshape_and_cache_flash_int16_kv,
++    triton_reshape_and_cache_flash_int16_v,
++)
+ from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+ from vllm.v1.kv_cache_interface import AttentionSpec
+ 
+@@ -43,6 +51,42 @@ MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
+ NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+ 
+ 
++def _get_heal_v_scale_cache(
++    layer: AttentionLayer,
++    value_cache: torch.Tensor,
++) -> torch.Tensor:
++    scale_cache = getattr(layer, "_heal_v_scale_cache", None)
++    expected_shape = value_cache.shape[:-1]
++    if (
++        scale_cache is None
++        or scale_cache.shape != expected_shape
++        or scale_cache.device != value_cache.device
++    ):
++        scale_cache = torch.empty(
++            expected_shape, dtype=torch.float32, device=value_cache.device
++        )
++        setattr(layer, "_heal_v_scale_cache", scale_cache)
++    return scale_cache
++
++
++def _get_heal_k_scale_cache(
++    layer: AttentionLayer,
++    key_cache: torch.Tensor,
++) -> torch.Tensor:
++    scale_cache = getattr(layer, "_heal_k_scale_cache", None)
++    expected_shape = key_cache.shape[:-1]
++    if (
++        scale_cache is None
++        or scale_cache.shape != expected_shape
++        or scale_cache.device != key_cache.device
++    ):
++        scale_cache = torch.empty(
++            expected_shape, dtype=torch.float32, device=key_cache.device
++        )
++        setattr(layer, "_heal_k_scale_cache", scale_cache)
++    return scale_cache
++
++
+ @dataclass
+ class TritonAttentionMetadata:
+     # NOTE(sang): Definition of context_len, query_len, and seq_len.
+@@ -417,6 +461,7 @@ class TritonAttentionImpl(AttentionImpl):
+         kv_cache: torch.Tensor,
+         attn_metadata: TritonAttentionMetadata,
+         output: torch.Tensor | None = None,
++        q_int16_scale: torch.Tensor | None = None,
+         output_scale: torch.Tensor | None = None,
+         output_block_scale: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+@@ -472,6 +517,21 @@ class TritonAttentionImpl(AttentionImpl):
+ 
+         # For decoder and cross-attention, use KV cache as before
+         key_cache, value_cache = kv_cache.unbind(1)
++        k_int16_scale = None
++        v_int16_scale = None
++        use_int16_k_cache = int16_k_cache_enabled_for_layer(layer)
++        use_int16_v_cache = int16_v_cache_enabled_for_layer(layer)
++        if use_int16_k_cache or use_int16_v_cache:
++            assert not self.kv_cache_dtype.startswith("fp8"), (
++                "HEAL.2 stores INT16 K/V payloads in the regular KV cache "
++                "and cannot be combined with fp8 KV cache."
++            )
++        if use_int16_k_cache:
++            k_int16_scale = _get_heal_k_scale_cache(layer, key_cache)
++            key_cache = key_cache.view(torch.int16)
++        if use_int16_v_cache:
++            v_int16_scale = _get_heal_v_scale_cache(layer, value_cache)
++            value_cache = value_cache.view(torch.int16)
+         if self.kv_cache_dtype.startswith("fp8"):
+             if key_cache.dtype != self.fp8_dtype:
+                 key_cache = key_cache.view(self.fp8_dtype)
+@@ -522,6 +582,9 @@ class TritonAttentionImpl(AttentionImpl):
+             sinks=self.sinks,
+             output_scale=output_scale,
+             mm_prefix_range=mm_prefix_range_tensor,
++            q_int16_scale=q_int16_scale,
++            k_int16_scale=k_int16_scale,
++            v_int16_scale=v_int16_scale,
+         )
+ 
+         return output
+@@ -586,6 +649,39 @@ class TritonAttentionImpl(AttentionImpl):
+             return
+         # For decoder and cross-attention, use KV cache as before
+         key_cache, value_cache = kv_cache.unbind(1)
++        use_int16_k_cache = int16_k_cache_enabled_for_layer(layer)
++        use_int16_v_cache = int16_v_cache_enabled_for_layer(layer)
++
++        if use_int16_k_cache or use_int16_v_cache:
++            assert not self.kv_cache_dtype.startswith("fp8"), (
++                "HEAL.2 stores INT16 K/V payloads in the regular KV cache "
++                "and cannot be combined with fp8 KV cache."
++            )
++        if use_int16_k_cache and use_int16_v_cache:
++            k_scale_cache = _get_heal_k_scale_cache(layer, key_cache)
++            v_scale_cache = _get_heal_v_scale_cache(layer, value_cache)
++            triton_reshape_and_cache_flash_int16_kv(
++                key,
++                value,
++                key_cache,
++                value_cache,
++                k_scale_cache,
++                v_scale_cache,
++                slot_mapping,
++            )
++            return
++
++        if use_int16_v_cache:
++            v_scale_cache = _get_heal_v_scale_cache(layer, value_cache)
++            triton_reshape_and_cache_flash_int16_v(
++                key,
++                value,
++                key_cache,
++                value_cache,
++                v_scale_cache,
++                slot_mapping,
++            )
++            return
+ 
+         # Reshape the input keys and values and store them in the cache.
+         if self.kv_cache_dtype.startswith("fp8"):
+@@ -606,6 +702,13 @@ class TritonAttentionImpl(AttentionImpl):
+         )
+ 
+     def fused_rope_kvcache_supported(self):
++        from vllm.model_executor.models.heal_runtime import (
++            int16_k_cache_enabled,
++            int16_v_cache_enabled,
++        )
++
++        if int16_k_cache_enabled() or int16_v_cache_enabled():
++            return False
+         return rocm_aiter_ops.is_enabled()
+ 
+     def do_rope_and_kv_cache_update(
+diff --git a/vllm/v1/attention/ops/triton_int16_v_cache.py b/vllm/v1/attention/ops/triton_int16_v_cache.py
+new file mode 100644
+index 000000000..198a550ed
+--- /dev/null
++++ b/vllm/v1/attention/ops/triton_int16_v_cache.py
+@@ -0,0 +1,345 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Triton helpers for HEAL INT16 KV-cache experiments."""
++
++import torch
++
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, triton
++
++
++if current_platform.is_rocm():
++
++    @triton.jit
++    def _round_int16(x):
++        return tl.extra.hip.libdevice.round(x).to(tl.int16)
++
++else:
++
++    @triton.jit
++    def _round_int16(x):
++        return tl.extra.cuda.libdevice.round(x).to(tl.int16)
++
++
++@triton.jit
++def _quantize_int16_vector_kernel(
++    src_ptr,
++    dst_i16_ptr,
++    scale_ptr,
++    src_stride_0: tl.int64,
++    src_stride_1: tl.int64,
++    src_stride_2: tl.int64,
++    dst_stride_0: tl.int64,
++    dst_stride_1: tl.int64,
++    dst_stride_2: tl.int64,
++    scale_stride_0: tl.int64,
++    scale_stride_1: tl.int64,
++    head_size: tl.constexpr,
++    HEAD_SIZE_PADDED: tl.constexpr,
++):
++    token_idx = tl.program_id(axis=0)
++    head_idx = tl.program_id(axis=1)
++    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
++    dim_mask = offs_d < head_size
++
++    src_offset = (
++        token_idx * src_stride_0 + head_idx * src_stride_1 + offs_d * src_stride_2
++    )
++    dst_offset = (
++        token_idx * dst_stride_0 + head_idx * dst_stride_1 + offs_d * dst_stride_2
++    )
++    scale_offset = token_idx * scale_stride_0 + head_idx * scale_stride_1
++
++    x = tl.load(src_ptr + src_offset, mask=dim_mask, other=0.0).to(tl.float32)
++    absmax = tl.max(tl.abs(tl.where(dim_mask, x, 0.0)), axis=0)
++    valid = (absmax > 0.0) & (absmax < float("inf")) & (absmax == absmax)
++    scale = tl.where(valid, absmax / 32767.0, 1.0)
++    q = tl.where(valid, x / scale, 0.0)
++    q = tl.minimum(tl.maximum(q, -32767.0), 32767.0)
++    q = _round_int16(q)
++
++    tl.store(dst_i16_ptr + dst_offset, q, mask=dim_mask)
++    tl.store(scale_ptr + scale_offset, scale)
++
++
++def triton_quantize_int16_q(query: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++    assert query.ndim == 3, "HEAL.3 expects query as [tokens, heads, head_size]"
++    query_i16 = torch.empty(query.shape, dtype=torch.int16, device=query.device)
++    q_scale = torch.empty(query.shape[:-1], dtype=torch.float32, device=query.device)
++    head_size = query.shape[2]
++    head_size_padded = triton.next_power_of_2(head_size)
++    grid = (query.shape[0], query.shape[1])
++
++    _quantize_int16_vector_kernel[grid](
++        src_ptr=query,
++        dst_i16_ptr=query_i16,
++        scale_ptr=q_scale,
++        src_stride_0=query.stride(0),
++        src_stride_1=query.stride(1),
++        src_stride_2=query.stride(2),
++        dst_stride_0=query_i16.stride(0),
++        dst_stride_1=query_i16.stride(1),
++        dst_stride_2=query_i16.stride(2),
++        scale_stride_0=q_scale.stride(0),
++        scale_stride_1=q_scale.stride(1),
++        head_size=head_size,
++        HEAD_SIZE_PADDED=head_size_padded,
++        num_warps=1,
++    )
++    return query_i16, q_scale
++
++
++@triton.jit
++def _reshape_and_cache_int16_v_kernel(
++    key_ptr,
++    value_ptr,
++    key_cache_ptr,
++    value_cache_i16_ptr,
++    v_scale_cache_ptr,
++    slot_mapping_ptr,
++    key_stride_0: tl.int64,
++    key_stride_1: tl.int64,
++    key_stride_2: tl.int64,
++    value_stride_0: tl.int64,
++    value_stride_1: tl.int64,
++    value_stride_2: tl.int64,
++    cache_stride_0: tl.int64,
++    cache_stride_1: tl.int64,
++    cache_stride_2: tl.int64,
++    cache_stride_3: tl.int64,
++    scale_stride_0: tl.int64,
++    scale_stride_1: tl.int64,
++    scale_stride_2: tl.int64,
++    block_size: tl.constexpr,
++    head_size: tl.constexpr,
++    HEAD_SIZE_PADDED: tl.constexpr,
++):
++    token_idx = tl.program_id(axis=0)
++    head_idx = tl.program_id(axis=1)
++    slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
++    if slot_idx < 0:
++        return
++
++    block_idx = slot_idx // block_size
++    block_offset = slot_idx % block_size
++    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
++    dim_mask = offs_d < head_size
++
++    key_offset = (
++        token_idx * key_stride_0 + head_idx * key_stride_1 + offs_d * key_stride_2
++    )
++    value_offset = (
++        token_idx * value_stride_0
++        + head_idx * value_stride_1
++        + offs_d * value_stride_2
++    )
++    cache_offset = (
++        block_idx * cache_stride_0
++        + block_offset * cache_stride_1
++        + head_idx * cache_stride_2
++        + offs_d * cache_stride_3
++    )
++    scale_offset = (
++        block_idx * scale_stride_0
++        + block_offset * scale_stride_1
++        + head_idx * scale_stride_2
++    )
++
++    key = tl.load(key_ptr + key_offset, mask=dim_mask, other=0.0)
++    value = tl.load(value_ptr + value_offset, mask=dim_mask, other=0.0).to(tl.float32)
++
++    absmax = tl.max(tl.abs(tl.where(dim_mask, value, 0.0)), axis=0)
++    valid = (absmax > 0.0) & (absmax < float("inf")) & (absmax == absmax)
++    scale = tl.where(valid, absmax / 32767.0, 1.0)
++    q_value = tl.where(valid, value / scale, 0.0)
++    q_value = tl.minimum(tl.maximum(q_value, -32767.0), 32767.0)
++    q_value = _round_int16(q_value)
++
++    tl.store(key_cache_ptr + cache_offset, key, mask=dim_mask)
++    tl.store(value_cache_i16_ptr + cache_offset, q_value, mask=dim_mask)
++    tl.store(v_scale_cache_ptr + scale_offset, scale)
++
++
++def triton_reshape_and_cache_flash_int16_v(
++    key: torch.Tensor,
++    value: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    v_scale_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++) -> None:
++    assert key_cache.ndim == 4, "HEAL.2 requires Triton NHD KV cache layout"
++    assert value_cache.ndim == 4, "HEAL.2 requires Triton NHD KV cache layout"
++    assert key.shape[1] == value.shape[1], "K/V head counts must match"
++    assert key.shape[2] == value.shape[2], "K/V head sizes must match"
++    assert v_scale_cache.shape == value_cache.shape[:-1]
++
++    value_cache_i16 = value_cache.view(torch.int16)
++    num_heads = key.shape[1]
++    head_size = key.shape[2]
++    head_size_padded = triton.next_power_of_2(head_size)
++    grid = (slot_mapping.shape[0], num_heads)
++
++    _reshape_and_cache_int16_v_kernel[grid](
++        key_ptr=key,
++        value_ptr=value,
++        key_cache_ptr=key_cache,
++        value_cache_i16_ptr=value_cache_i16,
++        v_scale_cache_ptr=v_scale_cache,
++        slot_mapping_ptr=slot_mapping,
++        key_stride_0=key.stride(0),
++        key_stride_1=key.stride(1),
++        key_stride_2=key.stride(2),
++        value_stride_0=value.stride(0),
++        value_stride_1=value.stride(1),
++        value_stride_2=value.stride(2),
++        cache_stride_0=key_cache.stride(0),
++        cache_stride_1=key_cache.stride(1),
++        cache_stride_2=key_cache.stride(2),
++        cache_stride_3=key_cache.stride(3),
++        scale_stride_0=v_scale_cache.stride(0),
++        scale_stride_1=v_scale_cache.stride(1),
++        scale_stride_2=v_scale_cache.stride(2),
++        block_size=key_cache.shape[1],
++        head_size=head_size,
++        HEAD_SIZE_PADDED=head_size_padded,
++        num_warps=1,
++    )
++
++
++@triton.jit
++def _reshape_and_cache_int16_kv_kernel(
++    key_ptr,
++    value_ptr,
++    key_cache_i16_ptr,
++    value_cache_i16_ptr,
++    k_scale_cache_ptr,
++    v_scale_cache_ptr,
++    slot_mapping_ptr,
++    key_stride_0: tl.int64,
++    key_stride_1: tl.int64,
++    key_stride_2: tl.int64,
++    value_stride_0: tl.int64,
++    value_stride_1: tl.int64,
++    value_stride_2: tl.int64,
++    cache_stride_0: tl.int64,
++    cache_stride_1: tl.int64,
++    cache_stride_2: tl.int64,
++    cache_stride_3: tl.int64,
++    scale_stride_0: tl.int64,
++    scale_stride_1: tl.int64,
++    scale_stride_2: tl.int64,
++    block_size: tl.constexpr,
++    head_size: tl.constexpr,
++    HEAD_SIZE_PADDED: tl.constexpr,
++):
++    token_idx = tl.program_id(axis=0)
++    head_idx = tl.program_id(axis=1)
++    slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
++    if slot_idx < 0:
++        return
++
++    block_idx = slot_idx // block_size
++    block_offset = slot_idx % block_size
++    offs_d = tl.arange(0, HEAD_SIZE_PADDED)
++    dim_mask = offs_d < head_size
++
++    key_offset = (
++        token_idx * key_stride_0 + head_idx * key_stride_1 + offs_d * key_stride_2
++    )
++    value_offset = (
++        token_idx * value_stride_0
++        + head_idx * value_stride_1
++        + offs_d * value_stride_2
++    )
++    cache_offset = (
++        block_idx * cache_stride_0
++        + block_offset * cache_stride_1
++        + head_idx * cache_stride_2
++        + offs_d * cache_stride_3
++    )
++    scale_offset = (
++        block_idx * scale_stride_0
++        + block_offset * scale_stride_1
++        + head_idx * scale_stride_2
++    )
++
++    key = tl.load(key_ptr + key_offset, mask=dim_mask, other=0.0).to(tl.float32)
++    value = tl.load(value_ptr + value_offset, mask=dim_mask, other=0.0).to(tl.float32)
++
++    key_absmax = tl.max(tl.abs(tl.where(dim_mask, key, 0.0)), axis=0)
++    key_valid = (
++        (key_absmax > 0.0)
++        & (key_absmax < float("inf"))
++        & (key_absmax == key_absmax)
++    )
++    key_scale = tl.where(key_valid, key_absmax / 32767.0, 1.0)
++    q_key = tl.where(key_valid, key / key_scale, 0.0)
++    q_key = tl.minimum(tl.maximum(q_key, -32767.0), 32767.0)
++    q_key = _round_int16(q_key)
++
++    value_absmax = tl.max(tl.abs(tl.where(dim_mask, value, 0.0)), axis=0)
++    value_valid = (
++        (value_absmax > 0.0)
++        & (value_absmax < float("inf"))
++        & (value_absmax == value_absmax)
++    )
++    value_scale = tl.where(value_valid, value_absmax / 32767.0, 1.0)
++    q_value = tl.where(value_valid, value / value_scale, 0.0)
++    q_value = tl.minimum(tl.maximum(q_value, -32767.0), 32767.0)
++    q_value = _round_int16(q_value)
++
++    tl.store(key_cache_i16_ptr + cache_offset, q_key, mask=dim_mask)
++    tl.store(value_cache_i16_ptr + cache_offset, q_value, mask=dim_mask)
++    tl.store(k_scale_cache_ptr + scale_offset, key_scale)
++    tl.store(v_scale_cache_ptr + scale_offset, value_scale)
++
++
++def triton_reshape_and_cache_flash_int16_kv(
++    key: torch.Tensor,
++    value: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    k_scale_cache: torch.Tensor,
++    v_scale_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++) -> None:
++    assert key_cache.ndim == 4, "HEAL.2 requires Triton NHD KV cache layout"
++    assert value_cache.ndim == 4, "HEAL.2 requires Triton NHD KV cache layout"
++    assert key.shape[1] == value.shape[1], "K/V head counts must match"
++    assert key.shape[2] == value.shape[2], "K/V head sizes must match"
++    assert k_scale_cache.shape == key_cache.shape[:-1]
++    assert v_scale_cache.shape == value_cache.shape[:-1]
++
++    key_cache_i16 = key_cache.view(torch.int16)
++    value_cache_i16 = value_cache.view(torch.int16)
++    num_heads = key.shape[1]
++    head_size = key.shape[2]
++    head_size_padded = triton.next_power_of_2(head_size)
++    grid = (slot_mapping.shape[0], num_heads)
++
++    _reshape_and_cache_int16_kv_kernel[grid](
++        key_ptr=key,
++        value_ptr=value,
++        key_cache_i16_ptr=key_cache_i16,
++        value_cache_i16_ptr=value_cache_i16,
++        k_scale_cache_ptr=k_scale_cache,
++        v_scale_cache_ptr=v_scale_cache,
++        slot_mapping_ptr=slot_mapping,
++        key_stride_0=key.stride(0),
++        key_stride_1=key.stride(1),
++        key_stride_2=key.stride(2),
++        value_stride_0=value.stride(0),
++        value_stride_1=value.stride(1),
++        value_stride_2=value.stride(2),
++        cache_stride_0=key_cache_i16.stride(0),
++        cache_stride_1=key_cache_i16.stride(1),
++        cache_stride_2=key_cache_i16.stride(2),
++        cache_stride_3=key_cache_i16.stride(3),
++        scale_stride_0=k_scale_cache.stride(0),
++        scale_stride_1=k_scale_cache.stride(1),
++        scale_stride_2=k_scale_cache.stride(2),
++        block_size=key_cache_i16.shape[1],
++        head_size=head_size,
++        HEAD_SIZE_PADDED=head_size_padded,
++        num_warps=1,
++    )
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index ca5d0e336..2f087d649 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -59,6 +59,7 @@ def find_seq_idx(
+ def kernel_unified_attention_2d(
+     output_ptr,  # [num_tokens, num_query_heads, head_size]
+     query_ptr,  # [num_tokens, num_query_heads, head_size]
++    q_int16_scale_ptr,  # [num_tokens, num_query_heads]
+     key_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
+     value_cache_ptr,  # [num_blks, blk_size, num_kv_heads, head_size]
+     sink_ptr,  # [num_query_heads]
+@@ -69,6 +70,8 @@ def kernel_unified_attention_2d(
+     scale,  # float32
+     k_scale,  # float32
+     v_scale,  # float32
++    k_int16_scale_ptr,  # [num_blks, blk_size, num_kv_heads]
++    v_int16_scale_ptr,  # [num_blks, blk_size, num_kv_heads]
+     out_scale,  # float32
+     softcap,  # float32
+     num_query_heads: tl.constexpr,  # int
+@@ -76,6 +79,8 @@ def kernel_unified_attention_2d(
+     block_table_stride: tl.int64,  # int
+     query_stride_0: tl.int64,  # int
+     query_stride_1: tl.int64,  # int, should be equal to head_size
++    q_int16_scale_stride_0: tl.int64,  # int
++    q_int16_scale_stride_1: tl.int64,  # int
+     output_stride_0: tl.int64,  # int
+     output_stride_1: tl.int64,  # int, should be equal to head_size
+     qq_bias_stride_0: tl.int64,  # int
+@@ -100,11 +105,21 @@ def kernel_unified_attention_2d(
+     stride_v_cache_1: tl.int64,  # int
+     stride_v_cache_2: tl.int64,  # int
+     stride_v_cache_3: tl.constexpr,  # int
++    stride_k_int16_scale_0: tl.int64,  # int
++    stride_k_int16_scale_1: tl.int64,  # int
++    stride_k_int16_scale_2: tl.int64,  # int
++    stride_v_int16_scale_0: tl.int64,  # int
++    stride_v_int16_scale_1: tl.int64,  # int
++    stride_v_int16_scale_2: tl.int64,  # int
+     query_start_len_ptr,  # [num_seqs+1]
+     BLOCK_Q: tl.constexpr,  # int
+     num_seqs: tl.int32,
+     BLOCK_M: tl.constexpr,  # int
+     USE_FP8: tl.constexpr,  # bool
++    USE_INT16_Q_INPUT: tl.constexpr,  # bool
++    USE_INT16_K_CACHE: tl.constexpr,  # bool
++    USE_INT16_V_CACHE: tl.constexpr,  # bool
++    FP32_DOT_INPUT_PRECISION: tl.constexpr,  # str
+     FP8_MIN: tl.constexpr = float8_info.min,
+     FP8_MAX: tl.constexpr = float8_info.max,
+ ):
+@@ -145,11 +160,27 @@ def kernel_unified_attention_2d(
+     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+ 
+     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
+-    Q = tl.load(
++    Q_load = tl.load(
+         query_ptr + query_offset,
+         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+         other=0.0,
+     )
++    if USE_INT16_Q_INPUT:
++        q_int16_scale_offset = (
++            query_offset_0 * q_int16_scale_stride_0
++            + query_offset_1 * q_int16_scale_stride_1
++        )
++        q_int16_scale = tl.load(
++            q_int16_scale_ptr + q_int16_scale_offset,
++            mask=query_mask_0 & query_mask_1,
++            other=0.0,
++        )
++        Q = Q_load.to(tl.float32) * q_int16_scale[:, None]
++    else:
++        Q = Q_load
++    if USE_INT16_Q_INPUT:
++        Q_hi = Q.to(tl.float16)
++        Q_lo_scaled = ((Q - Q_hi.to(tl.float32)) * 1024.0).to(tl.float16)
+ 
+     block_table_offset = seq_idx * block_table_stride
+ 
+@@ -259,7 +290,17 @@ def kernel_unified_attention_2d(
+             other=0.0,
+         )
+ 
+-        if K_load.dtype.is_fp8():
++        if USE_INT16_K_CACHE:
++            k_scale_offset = (
++                physical_block_idx * stride_k_int16_scale_0
++                + (seq_offset % BLOCK_SIZE) * stride_k_int16_scale_1
++                + kv_head_idx * stride_k_int16_scale_2
++            )
++            k_token_scale = tl.load(
++                k_int16_scale_ptr + k_scale_offset, mask=tile_mask, other=0.0
++            )
++            K = K_load.to(tl.float32) * k_token_scale[None, :]
++        elif K_load.dtype.is_fp8():
+             if Q.dtype.is_fp8():
+                 K = K_load
+             else:
+@@ -274,7 +315,17 @@ def kernel_unified_attention_2d(
+             other=0.0,
+         )
+ 
+-        if V_load.dtype.is_fp8():
++        if USE_INT16_V_CACHE:
++            v_scale_offset = (
++                physical_block_idx * stride_v_int16_scale_0
++                + (seq_offset % BLOCK_SIZE) * stride_v_int16_scale_1
++                + kv_head_idx * stride_v_int16_scale_2
++            )
++            v_token_scale = tl.load(
++                v_int16_scale_ptr + v_scale_offset, mask=tile_mask, other=0.0
++            )
++            V = V_load.to(tl.float32) * v_token_scale[:, None]
++        elif V_load.dtype.is_fp8():
+             if Q.dtype.is_fp8():
+                 V = V_load
+             else:
+@@ -318,7 +369,23 @@ def kernel_unified_attention_2d(
+         # S : (BLOCK_M, TILE_SIZE)
+         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+ 
+-        S += scale * tl.dot(Q, K)
++        if USE_INT16_Q_INPUT and USE_INT16_K_CACHE:
++            K_hi = K.to(tl.float16)
++            K_lo_scaled = ((K - K_hi.to(tl.float32)) * 1024.0).to(tl.float16)
++            S += scale * tl.dot(Q_hi, K_hi)
++            S += scale * tl.dot(Q_hi, K_lo_scaled) * (1.0 / 1024.0)
++            S += scale * tl.dot(Q_lo_scaled, K_hi) * (1.0 / 1024.0)
++        elif USE_INT16_Q_INPUT:
++            S += scale * tl.dot(Q_hi, K)
++            S += scale * tl.dot(Q_lo_scaled, K) * (1.0 / 1024.0)
++        elif USE_INT16_K_CACHE:
++            Q_fp16 = Q.to(tl.float16)
++            K_hi = K.to(tl.float16)
++            K_lo_scaled = ((K - K_hi.to(tl.float32)) * 1024.0).to(tl.float16)
++            S += scale * tl.dot(Q_fp16, K_hi)
++            S += scale * tl.dot(Q_fp16, K_lo_scaled) * (1.0 / 1024.0)
++        else:
++            S += scale * tl.dot(Q, K, input_precision=FP32_DOT_INPUT_PRECISION)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -382,7 +449,18 @@ def kernel_unified_attention_2d(
+             )
+ 
+         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+-        acc += tl.dot(P.to(V.dtype), V)
++        if USE_INT16_V_CACHE:
++            P_hi = P.to(tl.float16)
++            P_lo_scaled = ((P - P_hi.to(tl.float32)) * 1024.0).to(tl.float16)
++            V_hi = V.to(tl.float16)
++            V_lo_scaled = ((V - V_hi.to(tl.float32)) * 1024.0).to(tl.float16)
++            acc += tl.dot(P_hi, V_hi)
++            acc += tl.dot(P_hi, V_lo_scaled) * (1.0 / 1024.0)
++            acc += tl.dot(P_lo_scaled, V_hi) * (1.0 / 1024.0)
++        else:
++            acc += tl.dot(
++                P.to(V.dtype), V, input_precision=FP32_DOT_INPUT_PRECISION
++            )
+ 
+     # epilogue
+     acc = acc / L[:, None]
+@@ -410,6 +488,7 @@ def kernel_unified_attention_3d(
+     segm_max_ptr,  # [num_tokens, num_query_heads, num_segments]
+     segm_expsum_ptr,  # [num_tokens, num_query_heads, num_segments]
+     query_ptr,  # [num_tokens, num_query_heads, head_size]
++    q_int16_scale_ptr,  # [num_tokens, num_query_heads]
+     key_cache_ptr,  # [num_blks, num_kv_heads, head_size // x, blk_size, x]
+     value_cache_ptr,  # [num_blks, num_kv_heads, head_size, blk_size]
+     sink_ptr,  # [num_query_heads]
+@@ -420,12 +499,16 @@ def kernel_unified_attention_3d(
+     scale,  # float32
+     k_scale,  # float32
+     v_scale,  # float32
++    k_int16_scale_ptr,  # [num_blks, blk_size, num_kv_heads]
++    v_int16_scale_ptr,  # [num_blks, blk_size, num_kv_heads]
+     softcap,  # float32
+     num_query_heads: tl.constexpr,  # int
+     num_queries_per_kv: tl.constexpr,  # int
+     block_table_stride: tl.int64,  # int
+     query_stride_0: tl.int64,  # int
+     query_stride_1: tl.int64,  # int, should be equal to head_size
++    q_int16_scale_stride_0: tl.int64,  # int
++    q_int16_scale_stride_1: tl.int64,  # int
+     qq_bias_stride_0: tl.int64,  # int
+     BLOCK_SIZE: tl.constexpr,  # int
+     TILE_SIZE: tl.constexpr,  # int, must be power of 2
+@@ -445,6 +528,12 @@ def kernel_unified_attention_3d(
+     stride_v_cache_1: tl.int64,  # int
+     stride_v_cache_2: tl.int64,  # int
+     stride_v_cache_3: tl.constexpr,  # int
++    stride_k_int16_scale_0: tl.int64,  # int
++    stride_k_int16_scale_1: tl.int64,  # int
++    stride_k_int16_scale_2: tl.int64,  # int
++    stride_v_int16_scale_0: tl.int64,  # int
++    stride_v_int16_scale_1: tl.int64,  # int
++    stride_v_int16_scale_2: tl.int64,  # int
+     query_start_len_ptr,  # [num_seqs+1]
+     BLOCK_Q: tl.constexpr,  # int
+     num_seqs: tl.int32,
+@@ -453,6 +542,10 @@ def kernel_unified_attention_3d(
+     USE_MM_PREFIX: tl.constexpr,  # bool
+     MAX_MM_RANGES: tl.constexpr,  # int
+     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
++    USE_INT16_Q_INPUT: tl.constexpr,  # bool
++    USE_INT16_V_CACHE: tl.constexpr,  # bool
++    USE_INT16_K_CACHE: tl.constexpr,  # bool
++    FP32_DOT_INPUT_PRECISION: tl.constexpr,  # str
+ ):
+     q_block_global_idx = tl.program_id(0)
+     kv_head_idx = tl.program_id(1)
+@@ -502,11 +595,27 @@ def kernel_unified_attention_3d(
+     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+ 
+     # Q : (BLOCK_M, HEAD_SIZE_PADDED)
+-    Q = tl.load(
++    Q_load = tl.load(
+         query_ptr + query_offset,
+         mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
+         other=0.0,
+     )
++    if USE_INT16_Q_INPUT:
++        q_int16_scale_offset = (
++            query_offset_0 * q_int16_scale_stride_0
++            + query_offset_1 * q_int16_scale_stride_1
++        )
++        q_int16_scale = tl.load(
++            q_int16_scale_ptr + q_int16_scale_offset,
++            mask=query_mask_0 & query_mask_1,
++            other=0.0,
++        )
++        Q = Q_load.to(tl.float32) * q_int16_scale[:, None]
++    else:
++        Q = Q_load
++    if USE_INT16_Q_INPUT:
++        Q_hi = Q.to(tl.float16)
++        Q_lo_scaled = ((Q - Q_hi.to(tl.float32)) * 1024.0).to(tl.float16)
+ 
+     block_table_offset = seq_idx * block_table_stride
+ 
+@@ -614,7 +723,17 @@ def kernel_unified_attention_3d(
+             other=0.0,
+         )
+ 
+-        if K_load.dtype.is_fp8():
++        if USE_INT16_K_CACHE:
++            k_scale_offset = (
++                physical_block_idx * stride_k_int16_scale_0
++                + (seq_offset % BLOCK_SIZE) * stride_k_int16_scale_1
++                + kv_head_idx * stride_k_int16_scale_2
++            )
++            k_token_scale = tl.load(
++                k_int16_scale_ptr + k_scale_offset, mask=tile_mask, other=0.0
++            )
++            K = K_load.to(tl.float32) * k_token_scale[None, :]
++        elif K_load.dtype.is_fp8():
+             if Q.dtype.is_fp8():
+                 K = K_load
+             else:
+@@ -629,7 +748,17 @@ def kernel_unified_attention_3d(
+             other=0.0,
+         )
+ 
+-        if V_load.dtype.is_fp8():
++        if USE_INT16_V_CACHE:
++            v_scale_offset = (
++                physical_block_idx * stride_v_int16_scale_0
++                + (seq_offset % BLOCK_SIZE) * stride_v_int16_scale_1
++                + kv_head_idx * stride_v_int16_scale_2
++            )
++            v_token_scale = tl.load(
++                v_int16_scale_ptr + v_scale_offset, mask=tile_mask, other=0.0
++            )
++            V = V_load.to(tl.float32) * v_token_scale[:, None]
++        elif V_load.dtype.is_fp8():
+             if Q.dtype.is_fp8():
+                 V = V_load
+             else:
+@@ -672,7 +801,23 @@ def kernel_unified_attention_3d(
+ 
+         # S : (BLOCK_M, TILE_SIZE)
+         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+-        S += scale * tl.dot(Q, K)
++        if USE_INT16_Q_INPUT and USE_INT16_K_CACHE:
++            K_hi = K.to(tl.float16)
++            K_lo_scaled = ((K - K_hi.to(tl.float32)) * 1024.0).to(tl.float16)
++            S += scale * tl.dot(Q_hi, K_hi)
++            S += scale * tl.dot(Q_hi, K_lo_scaled) * (1.0 / 1024.0)
++            S += scale * tl.dot(Q_lo_scaled, K_hi) * (1.0 / 1024.0)
++        elif USE_INT16_Q_INPUT:
++            S += scale * tl.dot(Q_hi, K)
++            S += scale * tl.dot(Q_lo_scaled, K) * (1.0 / 1024.0)
++        elif USE_INT16_K_CACHE:
++            Q_fp16 = Q.to(tl.float16)
++            K_hi = K.to(tl.float16)
++            K_lo_scaled = ((K - K_hi.to(tl.float32)) * 1024.0).to(tl.float16)
++            S += scale * tl.dot(Q_fp16, K_hi)
++            S += scale * tl.dot(Q_fp16, K_lo_scaled) * (1.0 / 1024.0)
++        else:
++            S += scale * tl.dot(Q, K, input_precision=FP32_DOT_INPUT_PRECISION)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -736,7 +881,18 @@ def kernel_unified_attention_3d(
+             )
+ 
+         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+-        acc += tl.dot(P.to(V.dtype), V)
++        if USE_INT16_V_CACHE:
++            P_hi = P.to(tl.float16)
++            P_lo_scaled = ((P - P_hi.to(tl.float32)) * 1024.0).to(tl.float16)
++            V_hi = V.to(tl.float16)
++            V_lo_scaled = ((V - V_hi.to(tl.float32)) * 1024.0).to(tl.float16)
++            acc += tl.dot(P_hi, V_hi)
++            acc += tl.dot(P_hi, V_lo_scaled) * (1.0 / 1024.0)
++            acc += tl.dot(P_lo_scaled, V_hi) * (1.0 / 1024.0)
++        else:
++            acc += tl.dot(
++                P.to(V.dtype), V, input_precision=FP32_DOT_INPUT_PRECISION
++            )
+ 
+     segm_output_offset = (
+         query_offset_0[:, None].to(tl.int64)
+@@ -911,6 +1067,9 @@ def unified_attention(
+     # Optional tensor for prefix lengths (PrefixLM support)
+     mm_prefix_range=None,
+     use_alibi_sqrt=False,
++    q_int16_scale=None,
++    k_int16_scale=None,
++    v_int16_scale=None,
+ ):
+     assert causal, "Only causal attention is supported"
+     assert q_descale is None, "Q scales not supported"
+@@ -931,6 +1090,12 @@ def unified_attention(
+ 
+     use_alibi_slopes = alibi_slopes is not None
+     use_qq_bias = qq_bias is not None
++    use_int16_q_input = q_int16_scale is not None
++    use_int16_k_cache = k_int16_scale is not None
++    use_int16_v_cache = v_int16_scale is not None
++    fp32_dot_input_precision = (
++        "ieee" if envs.VLLM_FLOAT32_MATMUL_PRECISION == "highest" else "tf32"
++    )
+ 
+     block_size = v.shape[1]
+     num_seqs = len(seqused_k)
+@@ -994,6 +1159,7 @@ def unified_attention(
+         ](
+             output_ptr=out,
+             query_ptr=q,
++            q_int16_scale_ptr=q_int16_scale,
+             key_cache_ptr=k,
+             value_cache_ptr=v,
+             sink_ptr=sinks,
+@@ -1004,6 +1170,8 @@ def unified_attention(
+             scale=softmax_scale,
+             k_scale=k_descale,
+             v_scale=v_descale,
++            k_int16_scale_ptr=k_int16_scale,
++            v_int16_scale_ptr=v_int16_scale,
+             out_scale=1 / output_scale if output_scale is not None else 1.0,
+             softcap=softcap,
+             num_query_heads=num_query_heads,
+@@ -1011,6 +1179,12 @@ def unified_attention(
+             block_table_stride=block_table.stride(0),
+             query_stride_0=q.stride(0),
+             query_stride_1=q.stride(1),
++            q_int16_scale_stride_0=(
++                q_int16_scale.stride(0) if use_int16_q_input else 0
++            ),
++            q_int16_scale_stride_1=(
++                q_int16_scale.stride(1) if use_int16_q_input else 0
++            ),
+             output_stride_0=out.stride(0),
+             output_stride_1=out.stride(1),
+             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+@@ -1035,11 +1209,33 @@ def unified_attention(
+             stride_v_cache_1=v.stride(1),
+             stride_v_cache_2=v.stride(2),
+             stride_v_cache_3=v.stride(3),
++            stride_k_int16_scale_0=(
++                k_int16_scale.stride(0) if use_int16_k_cache else 0
++            ),
++            stride_k_int16_scale_1=(
++                k_int16_scale.stride(1) if use_int16_k_cache else 0
++            ),
++            stride_k_int16_scale_2=(
++                k_int16_scale.stride(2) if use_int16_k_cache else 0
++            ),
++            stride_v_int16_scale_0=(
++                v_int16_scale.stride(0) if use_int16_v_cache else 0
++            ),
++            stride_v_int16_scale_1=(
++                v_int16_scale.stride(1) if use_int16_v_cache else 0
++            ),
++            stride_v_int16_scale_2=(
++                v_int16_scale.stride(2) if use_int16_v_cache else 0
++            ),
+             query_start_len_ptr=cu_seqlens_q,
+             BLOCK_Q=BLOCK_Q,
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             USE_FP8=output_scale is not None,
++            USE_INT16_Q_INPUT=use_int16_q_input,
++            USE_INT16_K_CACHE=use_int16_k_cache,
++            USE_INT16_V_CACHE=use_int16_v_cache,
++            FP32_DOT_INPUT_PRECISION=fp32_dot_input_precision,
+         )
+     else:
+         kernel_unified_attention_3d[
+@@ -1049,6 +1245,7 @@ def unified_attention(
+             segm_max_ptr=softmax_segm_max,
+             segm_expsum_ptr=softmax_segm_expsum,
+             query_ptr=q,
++            q_int16_scale_ptr=q_int16_scale,
+             key_cache_ptr=k,
+             value_cache_ptr=v,
+             sink_ptr=sinks,
+@@ -1059,12 +1256,20 @@ def unified_attention(
+             scale=softmax_scale,
+             k_scale=k_descale,
+             v_scale=v_descale,
++            k_int16_scale_ptr=k_int16_scale,
++            v_int16_scale_ptr=v_int16_scale,
+             softcap=softcap,
+             num_query_heads=num_query_heads,
+             num_queries_per_kv=num_queries_per_kv,
+             block_table_stride=block_table.stride(0),
+             query_stride_0=q.stride(0),
+             query_stride_1=q.stride(1),
++            q_int16_scale_stride_0=(
++                q_int16_scale.stride(0) if use_int16_q_input else 0
++            ),
++            q_int16_scale_stride_1=(
++                q_int16_scale.stride(1) if use_int16_q_input else 0
++            ),
+             qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+             BLOCK_SIZE=block_size,
+             TILE_SIZE=TILE_SIZE_DECODE,
+@@ -1087,11 +1292,33 @@ def unified_attention(
+             stride_v_cache_1=v.stride(1),
+             stride_v_cache_2=v.stride(2),
+             stride_v_cache_3=v.stride(3),
++            stride_k_int16_scale_0=(
++                k_int16_scale.stride(0) if use_int16_k_cache else 0
++            ),
++            stride_k_int16_scale_1=(
++                k_int16_scale.stride(1) if use_int16_k_cache else 0
++            ),
++            stride_k_int16_scale_2=(
++                k_int16_scale.stride(2) if use_int16_k_cache else 0
++            ),
++            stride_v_int16_scale_0=(
++                v_int16_scale.stride(0) if use_int16_v_cache else 0
++            ),
++            stride_v_int16_scale_1=(
++                v_int16_scale.stride(1) if use_int16_v_cache else 0
++            ),
++            stride_v_int16_scale_2=(
++                v_int16_scale.stride(2) if use_int16_v_cache else 0
++            ),
+             query_start_len_ptr=cu_seqlens_q,
+             BLOCK_Q=BLOCK_Q,
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
++            USE_INT16_Q_INPUT=use_int16_q_input,
++            USE_INT16_V_CACHE=use_int16_v_cache,
++            USE_INT16_K_CACHE=use_int16_k_cache,
++            FP32_DOT_INPUT_PRECISION=fp32_dot_input_precision,
+         )
+         reduce_segments[(q.shape[0], num_query_heads)](
+             output_ptr=out,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 2e62206da..7eed3892b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -3488,6 +3488,71 @@ class GPUModelRunner(
+         finally:
+             self.prepare_inputs_event.record()
+ 
++    def _set_tensor_trace_row_metadata(
++        self,
++        *,
++        num_reqs: int,
++        num_tokens_unpadded: int,
++        num_tokens_padded: int,
++        num_scheduled_tokens_np: np.ndarray,
++    ) -> None:
++        try:
++            from vllm.model_executor.models.tensor_trace import (
++                clear_tensor_trace_row_metadata,
++                set_tensor_trace_row_metadata,
++                tensor_trace_enabled,
++            )
++        except (ImportError, AttributeError):
++            return
++
++        if not tensor_trace_enabled():
++            return
++        if num_tokens_unpadded <= 0:
++            clear_tensor_trace_row_metadata()
++            return
++
++        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens_np)
++        token_offsets = self.query_pos.np[:num_tokens_unpadded]
++        token_positions = (
++            self.input_batch.num_computed_tokens_cpu[req_indices] + token_offsets
++        )
++
++        row_request_indices = req_indices.astype(np.int32, copy=False).tolist()
++        row_token_positions = token_positions.astype(np.int64, copy=False).tolist()
++        row_token_ids = [
++            int(token_id)
++            for token_id in self.input_ids.cpu[:num_tokens_unpadded].tolist()
++        ]
++
++        if num_tokens_padded > num_tokens_unpadded:
++            padding = num_tokens_padded - num_tokens_unpadded
++            row_request_indices.extend([-1] * padding)
++            row_token_positions.extend([-1] * padding)
++            row_token_ids.extend([-1] * padding)
++
++        set_tensor_trace_row_metadata(
++            {
++                "request_ids": [
++                    str(req_id) for req_id in self.input_batch.req_ids[:num_reqs]
++                ],
++                "row_request_indices": row_request_indices,
++                "row_token_positions": row_token_positions,
++                "row_token_ids": row_token_ids,
++                "unpadded_rows": int(num_tokens_unpadded),
++                "padded_rows": int(num_tokens_padded),
++            }
++        )
++
++    @staticmethod
++    def _clear_tensor_trace_row_metadata() -> None:
++        try:
++            from vllm.model_executor.models.tensor_trace import (
++                clear_tensor_trace_row_metadata,
++            )
++        except (ImportError, AttributeError):
++            return
++        clear_tensor_trace_row_metadata()
++
+     def _model_forward(
+         self,
+         input_ids: torch.Tensor | None = None,
+@@ -4013,31 +4078,40 @@ class GPUModelRunner(
+         # When spec decode is enabled, defer connector finalization
+         # (wait_for_save + clear metadata) until after draft model runs.
+         defer_kv_connector_finalize = self.speculative_config is not None
+-        with (
+-            set_forward_context(
+-                attn_metadata,
+-                self.vllm_config,
+-                num_tokens=num_tokens_padded,
+-                num_tokens_across_dp=num_tokens_across_dp,
+-                cudagraph_runtime_mode=cudagraph_mode,
+-                batch_descriptor=batch_desc,
+-                ubatch_slices=ubatch_slices_padded,
+-                slot_mapping=slot_mappings,
+-                skip_compiled=has_encoder_input,
+-            ),
+-            record_function_or_nullcontext("gpu_model_runner: forward"),
+-            self.maybe_get_kv_connector_output(
+-                scheduler_output,
+-                defer_finalize=defer_kv_connector_finalize,
+-            ) as kv_connector_output,
+-        ):
+-            model_output = self._model_forward(
+-                input_ids=input_ids,
+-                positions=positions,
+-                intermediate_tensors=intermediate_tensors,
+-                inputs_embeds=inputs_embeds,
+-                **model_kwargs,
+-            )
++        self._set_tensor_trace_row_metadata(
++            num_reqs=num_reqs,
++            num_tokens_unpadded=num_tokens_unpadded,
++            num_tokens_padded=num_tokens_padded,
++            num_scheduled_tokens_np=num_scheduled_tokens_np,
++        )
++        try:
++            with (
++                set_forward_context(
++                    attn_metadata,
++                    self.vllm_config,
++                    num_tokens=num_tokens_padded,
++                    num_tokens_across_dp=num_tokens_across_dp,
++                    cudagraph_runtime_mode=cudagraph_mode,
++                    batch_descriptor=batch_desc,
++                    ubatch_slices=ubatch_slices_padded,
++                    slot_mapping=slot_mappings,
++                    skip_compiled=has_encoder_input,
++                ),
++                record_function_or_nullcontext("gpu_model_runner: forward"),
++                self.maybe_get_kv_connector_output(
++                    scheduler_output,
++                    defer_finalize=defer_kv_connector_finalize,
++                ) as kv_connector_output,
++            ):
++                model_output = self._model_forward(
++                    input_ids=input_ids,
++                    positions=positions,
++                    intermediate_tensors=intermediate_tensors,
++                    inputs_embeds=inputs_embeds,
++                    **model_kwargs,
++                )
++        finally:
++            self._clear_tensor_trace_row_metadata()
+ 
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 83fc12cb5..e23f21df8 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -12,6 +12,10 @@ import torch
+ from vllm.config import CacheConfig, VllmConfig
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention import Attention
++from vllm.model_executor.models.heal_runtime import (
++    int16_k_cache_enabled,
++    int16_v_cache_enabled,
++)
+ from vllm.model_executor.models.interfaces import MultiModalEmbeddings
+ from vllm.model_executor.models.utils import extract_layer_index
+ from vllm.platforms import current_platform
+@@ -510,7 +514,22 @@ def bind_kv_cache(
+ 
+     # Bind kv_caches to forward context
+     for layer_name, kv_cache in kv_caches.items():
+-        forward_context[layer_name].kv_cache = kv_cache
++        layer = forward_context[layer_name]
++        layer.kv_cache = kv_cache
++        if int16_v_cache_enabled() and kv_cache.ndim == 5 and kv_cache.shape[1] == 2:
++            value_cache = kv_cache[:, 1]
++            layer._heal_v_scale_cache = torch.empty(
++                value_cache.shape[:-1],
++                dtype=torch.float32,
++                device=value_cache.device,
++            )
++        if int16_k_cache_enabled() and kv_cache.ndim == 5 and kv_cache.shape[1] == 2:
++            key_cache = kv_cache[:, 0]
++            layer._heal_k_scale_cache = torch.empty(
++                key_cache.shape[:-1],
++                dtype=torch.float32,
++                device=key_cache.device,
++            )
+ 
+ 
+ def is_residual_scattered_for_sp(

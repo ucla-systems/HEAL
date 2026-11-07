@@ -1,0 +1,232 @@
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 2ecced3df..7598e67de 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -76,6 +76,7 @@ from .utils import (
+     make_layers,
+     maybe_prefix,
+ )
++from .qkv_distribution_trace import record_qkv_distribution as _record_qkv_distribution
+ 
+ 
+ class LlamaMLP(nn.Module):
+@@ -138,6 +139,7 @@ class LlamaAttention(nn.Module):
+     ) -> None:
+         super().__init__()
+         layer_idx = extract_layer_index(prefix)
++        self.layer_idx = layer_idx
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -228,6 +230,7 @@ class LlamaAttention(nn.Module):
+         qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         q, k = self.rotary_emb(positions, q, k)
++        _record_qkv_distribution(self.layer_idx, q, k, v)
+         attn_output = self.attn(q, k, v)
+         output, _ = self.o_proj(attn_output)
+         return output
+diff --git a/vllm/model_executor/models/qkv_distribution_trace.py b/vllm/model_executor/models/qkv_distribution_trace.py
+new file mode 100644
+index 000000000..7760111c8
+--- /dev/null
++++ b/vllm/model_executor/models/qkv_distribution_trace.py
+@@ -0,0 +1,142 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Env-gated attention-input Q/K/V dynamic-range statistics."""
++
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++
++import torch
++
++_LABELS = ("q", "k", "v")
++_RATIO_CHUNKS: dict[int, dict[str, list[torch.Tensor]]] = {}
++
++
++def _output_file() -> str:
++    return os.environ.get("VLLM_QKV_DISTRIBUTION_FILE", "")
++
++
++def qkv_distribution_enabled() -> bool:
++    return bool(_output_file())
++
++
++def clear_qkv_distribution_stats() -> None:
++    _RATIO_CHUNKS.clear()
++
++
++def _ratio_rows(tensor: torch.Tensor) -> torch.Tensor:
++    rows = tensor.detach().reshape(-1, tensor.shape[-1]).to(torch.float32)
++    abs_rows = rows.abs()
++    absmax = abs_rows.amax(dim=-1)
++    absstd = abs_rows.std(dim=-1, unbiased=False)
++    return torch.where(
++        absstd > 0,
++        absmax / absstd,
++        torch.full_like(absmax, float("inf")),
++    )
++
++
++def record_qkv_distribution(
++    layer_idx: int,
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++) -> None:
++    if not qkv_distribution_enabled():
++        return
++    layer = int(layer_idx)
++    layer_chunks = _RATIO_CHUNKS.setdefault(
++        layer, {label: [] for label in _LABELS}
++    )
++    with torch.no_grad():
++        for label, tensor in zip(_LABELS, (q, k, v), strict=True):
++            if not torch.is_tensor(tensor) or not torch.is_floating_point(tensor):
++                continue
++            layer_chunks[label].append(_ratio_rows(tensor).cpu().contiguous())
++
++
++def _cat_layer_label(layer: int, label: str) -> torch.Tensor:
++    chunks = _RATIO_CHUNKS.get(layer, {}).get(label, [])
++    if not chunks:
++        return torch.empty(0, dtype=torch.float32)
++    return torch.cat(chunks, dim=0).to(torch.float32).contiguous()
++
++
++def _build_rectangular_stats(layers: list[int]) -> torch.Tensor | None:
++    if not layers:
++        return None
++    count: int | None = None
++    layer_tensors: list[torch.Tensor] = []
++    for layer in layers:
++        qkv_tensors = [_cat_layer_label(layer, label) for label in _LABELS]
++        lengths = {int(tensor.numel()) for tensor in qkv_tensors}
++        if len(lengths) != 1:
++            return None
++        layer_count = lengths.pop()
++        if count is None:
++            count = layer_count
++        elif count != layer_count:
++            return None
++        layer_tensors.append(torch.stack(qkv_tensors, dim=0))
++    return torch.stack(layer_tensors, dim=0)
++
++
++def _summary(layers: list[int], stats: torch.Tensor | None) -> dict[str, object]:
++    counts = {
++        str(layer): {
++            label: int(sum(chunk.numel() for chunk in _RATIO_CHUNKS[layer][label]))
++            for label in _LABELS
++        }
++        for layer in layers
++    }
++    return {
++        "schema_version": 1,
++        "metric": "max(abs(x)) / std(abs(x), correction=0)",
++        "capture_stage": "attention inputs immediately before self.attn(q, k, v)",
++        "qkv_labels": list(_LABELS),
++        "layers": layers,
++        "counts": counts,
++        "stats_shape": list(stats.shape) if stats is not None else None,
++    }
++
++
++def flush_qkv_distribution_stats(
++    output_file: str | os.PathLike[str] | None = None,
++    *,
++    clear: bool = True,
++) -> None:
++    target = str(output_file) if output_file is not None else _output_file()
++    if not target or not _RATIO_CHUNKS:
++        if clear:
++            clear_qkv_distribution_stats()
++        return
++
++    layers = sorted(_RATIO_CHUNKS)
++    stats = _build_rectangular_stats(layers)
++    summary = _summary(layers, stats)
++    payload: dict[str, object] = {
++        "schema_version": 1,
++        "metric": "max(abs(x)) / std(abs(x), correction=0)",
++        "capture_stage": "attention inputs immediately before self.attn(q, k, v)",
++        "qkv_labels": list(_LABELS),
++        "layers": torch.tensor(layers, dtype=torch.int64),
++        "metadata": summary,
++    }
++    if stats is not None:
++        payload["stats"] = stats
++    else:
++        payload["stats_by_layer"] = {
++            str(layer): {label: _cat_layer_label(layer, label) for label in _LABELS}
++            for layer in layers
++        }
++
++    path = Path(target)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    torch.save(payload, path)
++    path.with_suffix(path.suffix + ".summary.json").write_text(
++        json.dumps(summary, indent=2, sort_keys=True) + "\n",
++        encoding="utf-8",
++    )
++    if clear:
++        clear_qkv_distribution_stats()
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 27aa6175b..d1eafb521 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -78,6 +78,7 @@ from .utils import (
+     make_layers,
+     maybe_prefix,
+ )
++from .qkv_distribution_trace import record_qkv_distribution as _record_qkv_distribution
+ 
+ 
+ class Qwen2MLP(nn.Module):
+@@ -134,6 +135,7 @@ class Qwen2Attention(nn.Module):
+         rms_norm_eps: float = 1e-6,
+     ) -> None:
+         super().__init__()
++        self.layer_idx = extract_layer_index(prefix)
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -231,6 +233,7 @@ class Qwen2Attention(nn.Module):
+             k = k.view(total_tokens, self.kv_size)
+ 
+         q, k = self.rotary_emb(positions, q, k)
++        _record_qkv_distribution(self.layer_idx, q, k, v)
+         attn_output = self.attn(q, k, v)
+         output, _ = self.o_proj(attn_output)
+         return output
+diff --git a/vllm/model_executor/models/qwen3.py b/vllm/model_executor/models/qwen3.py
+index 91931f9f4..33426caf5 100644
+--- a/vllm/model_executor/models/qwen3.py
++++ b/vllm/model_executor/models/qwen3.py
+@@ -49,6 +49,7 @@ from vllm.transformers_utils.config import set_default_rope_theta
+ from vllm.v1.attention.backend import AttentionType
+ 
+ from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
++from .qkv_distribution_trace import record_qkv_distribution as _record_qkv_distribution
+ from .qwen2 import Qwen2MLP as Qwen3MLP
+ from .qwen2 import Qwen2Model
+ from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
+@@ -74,6 +75,7 @@ class Qwen3Attention(nn.Module):
+         dual_chunk_attention_config: dict[str, Any] | None = None,
+     ) -> None:
+         super().__init__()
++        self.layer_idx = extract_layer_index(prefix)
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -157,6 +159,7 @@ class Qwen3Attention(nn.Module):
+         k_by_head = self.k_norm(k_by_head)
+         k = k_by_head.view(k.shape)
+         q, k = self.rotary_emb(positions, q, k)
++        _record_qkv_distribution(self.layer_idx, q, k, v)
+         attn_output = self.attn(q, k, v)
+         output, _ = self.o_proj(attn_output)
+         return output

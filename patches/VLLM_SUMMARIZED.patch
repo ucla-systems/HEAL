@@ -1,0 +1,1842 @@
+diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
+index 7fa804587..509c5a0ab 100644
+--- a/vllm/model_executor/layers/layernorm.py
++++ b/vllm/model_executor/layers/layernorm.py
+@@ -18,6 +18,15 @@ from vllm.platforms import current_platform
+ logger = init_logger(__name__)
+ 
+ 
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ def _can_view_as_2d(x: torch.Tensor) -> bool:
+     """Return True if x.view(-1, x.shape[-1]) is viewable (no copy)."""
+     if x.dim() < 2:
+@@ -271,12 +280,15 @@ class RMSNorm(CustomOp):
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         """PyTorch-native implementation equivalent to forward()."""
+ 
++        weight = self.weight.data if self.has_weight else None
++        if _layercast_enabled() and weight is not None:
++            weight = weight.to(torch.float32)
+         return self.forward_static(
+             x,
+             self.variance_epsilon,
+             self.hidden_size,
+             x.dtype,
+-            self.weight.data if self.has_weight else None,
++            weight,
+             residual,
+             self.variance_size_override,
+         )
+@@ -288,6 +300,13 @@ class RMSNorm(CustomOp):
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         if self.variance_size_override is not None:
+             return self.forward_native(x, residual)
++        if _layercast_enabled() and self.has_weight:
++            weight = self.weight.data.to(torch.float32)
++            if residual is not None:
++                return fused_add_rms_norm(
++                    x, residual, weight, self.variance_epsilon
++                )
++            return rms_norm(x, weight, self.variance_epsilon)
+ 
+         # Optional Oink SM100 fast path (no residual). This path is
+         # torch.compile-friendly via torch.ops.oink.rmsnorm and preserves
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 44fd516f5..2de26431c 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -5,6 +5,7 @@ import itertools
+ from abc import abstractmethod
+ 
+ import torch
++import torch.nn.functional as F
+ from torch.nn.parameter import Parameter, UninitializedParameter
+ 
+ import vllm.envs as envs
+@@ -42,6 +43,16 @@ from vllm.platforms import current_platform
+ 
+ logger = init_logger(__name__)
+ 
++
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ WEIGHT_LOADER_V2_SUPPORTED = [
+     "UnquantizedLinearMethod",
+     "CompressedTensorsLinearMethod",
+@@ -223,6 +234,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if _layercast_enabled() and torch.is_floating_point(x):
++            weight = layer.weight
++            if torch.is_floating_point(weight):
++                bias = None if bias is None else bias.to(torch.float32)
++                return F.linear(x.to(torch.float32), weight.to(torch.float32), bias)
+         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+             return linear_batch_invariant(x, layer.weight, bias)
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+diff --git a/vllm/model_executor/layers/logits_processor.py b/vllm/model_executor/layers/logits_processor.py
+index dd2a61bc6..a8f5f4f46 100644
+--- a/vllm/model_executor/layers/logits_processor.py
++++ b/vllm/model_executor/layers/logits_processor.py
+@@ -14,6 +14,30 @@ from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmb
+ from vllm.platforms import current_platform
+ 
+ 
++def _trace_lm_head_output(
++    lm_head: VocabParallelEmbedding,
++    logits: torch.Tensor,
++) -> torch.Tensor:
++    stage = getattr(lm_head, "_vllm_lm_head_output_stage", None)
++    if stage is None:
++        return logits
++    from vllm.model_executor.models.tensor_trace import record_dump_tensor
++
++    return record_dump_tensor("everything", stage, logits)
++
++
++def _trace_final_logits(
++    logits_processor: "LogitsProcessor",
++    logits: torch.Tensor,
++) -> torch.Tensor:
++    stage = getattr(logits_processor, "_vllm_final_logits_stage", None)
++    if stage is None:
++        return logits
++    from vllm.model_executor.models.tensor_trace import record_dump_tensor
++
++    return record_dump_tensor("everything", stage, logits)
++
++
+ # --8<-- [start:logits_processor]
+ @CustomOp.register("logits_processor")
+ class LogitsProcessor(CustomOp):
+@@ -70,6 +94,7 @@ class LogitsProcessor(CustomOp):
+ 
+             if self.scale != 1.0:
+                 logits *= self.scale
++            logits = _trace_final_logits(self, logits)
+         return logits
+ 
+     def _gather_logits(self, logits: torch.Tensor) -> torch.Tensor:
+@@ -94,6 +119,7 @@ class LogitsProcessor(CustomOp):
+     ) -> torch.Tensor | None:
+         # Get the logits for the next tokens.
+         logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
++        logits = _trace_lm_head_output(lm_head, logits)
+ 
+         # Gather logits for TP
+         logits = self._gather_logits(logits)
+@@ -123,6 +149,7 @@ class LogitsProcessor(CustomOp):
+         tp_size = get_tensor_model_parallel_world_size()
+ 
+         logits = lm_head.quant_method.apply(lm_head, hidden_states, bias=embedding_bias)
++        logits = _trace_lm_head_output(lm_head, logits)
+         if self.soft_cap is not None:
+             logits = torch.tanh(logits / self.soft_cap) * self.soft_cap
+         if self.scale != 1.0:
+diff --git a/vllm/model_executor/layers/rotary_embedding/__init__.py b/vllm/model_executor/layers/rotary_embedding/__init__.py
+index 28157daab..b4263c96a 100644
+--- a/vllm/model_executor/layers/rotary_embedding/__init__.py
++++ b/vllm/model_executor/layers/rotary_embedding/__init__.py
+@@ -26,6 +26,15 @@ from .yarn_scaling_rope import YaRNScalingRotaryEmbedding
+ _ROPE_DICT: dict[tuple[Any, ...], RotaryEmbedding] = {}
+ 
+ 
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ def get_rope(
+     head_size: int,
+     max_position: int,
+@@ -34,7 +43,9 @@ def get_rope(
+     dtype: torch.dtype | None = None,
+     dual_chunk_attention_config: dict[str, Any] | None = None,
+ ) -> RotaryEmbedding:
+-    if dtype is None:
++    if _layercast_enabled():
++        dtype = torch.float32
++    elif dtype is None:
+         dtype = torch.get_default_dtype()
+     if rope_parameters is not None:
+         # Transforms every value that is a list into a tuple for caching calls
+diff --git a/vllm/model_executor/layers/rotary_embedding/base.py b/vllm/model_executor/layers/rotary_embedding/base.py
+index 1374334b2..0e1c297b7 100644
+--- a/vllm/model_executor/layers/rotary_embedding/base.py
++++ b/vllm/model_executor/layers/rotary_embedding/base.py
+@@ -10,6 +10,15 @@ from vllm.model_executor.custom_op import CustomOp
+ from .common import ApplyRotaryEmb
+ 
+ 
++def _layercast_keep_fp32_rope_cache() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ # --8<-- [start:rotary_embedding]
+ @CustomOp.register("rotary_embedding")
+ class RotaryEmbeddingBase(CustomOp):
+@@ -101,6 +110,13 @@ class RotaryEmbeddingBase(CustomOp):
+         ):
+             return cos_sin_cache
+ 
++        if (
++            cos_sin_cache.dtype is torch.float32
++            and query.dtype is not torch.float32
++            and _layercast_keep_fp32_rope_cache()
++        ):
++            return cos_sin_cache.to(query.device, dtype=query.dtype)
++
+         cos_sin_cache = cos_sin_cache.to(query.device, dtype=query.dtype)
+         # Avoid mutating buffers during torch.compile (cudagraph) tracing.
+         if torch.compiler.is_compiling():
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index daaa86bed..f10b87b8c 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -28,6 +28,15 @@ from vllm.platforms import current_platform
+ DEFAULT_VOCAB_PADDING_SIZE = 64
+ 
+ 
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+     """Unquantized method for embeddings."""
+ 
+@@ -66,9 +75,16 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if _layercast_enabled() and torch.is_floating_point(x):
++            weight = layer.weight
++            if torch.is_floating_point(weight):
++                bias = None if bias is None else bias.to(torch.float32)
++                return F.linear(x.to(torch.float32), weight.to(torch.float32), bias)
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+ 
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
++        if _layercast_enabled() and torch.is_floating_point(layer.weight):
++            return F.embedding(input_, layer.weight.to(torch.float32))
+         return F.embedding(input_, layer.weight)
+ 
+ 
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index d6c38664f..cd7b4f58d 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
++import os
+ 
+ import torch
+ import torch.nn as nn
+@@ -22,6 +23,47 @@ from vllm.utils.torch_utils import set_default_torch_dtype
+ logger = init_logger(__name__)
+ 
+ 
++def _layercast_model_init_dtype(dtype: torch.dtype) -> torch.dtype:
++    enabled = os.environ.get("VLLM_LAYERCAST_FORCE_FP32", "").lower()
++    if enabled in {"1", "true", "yes", "on"} and dtype is torch.float32:
++        return torch.bfloat16
++    return dtype
++
++
++def _restore_layercast_buffer_dtype(model: nn.Module, dtype: torch.dtype) -> None:
++    enabled = os.environ.get("VLLM_LAYERCAST_FORCE_FP32", "").lower()
++    if enabled not in {"1", "true", "yes", "on"}:
++        return
++    for module in model.modules():
++        if isinstance(getattr(module, "dtype", None), torch.dtype):
++            module.dtype = dtype
++        buffer = getattr(module, "cos_sin_cache", None)
++        if (
++            isinstance(buffer, torch.Tensor)
++            and buffer.dtype != dtype
++            and hasattr(module, "_compute_cos_sin_cache")
++        ):
++            cache = module._compute_cos_sin_cache()
++            if not getattr(module, "use_flashinfer", False):
++                cache = cache.to(dtype=dtype)
++            cache = cache.to(device=buffer.device)
++            module._buffers["cos_sin_cache"] = cache
++        for name, buffer in module.named_buffers(recurse=False):
++            if buffer is not None and torch.is_floating_point(buffer):
++                module._buffers[name] = buffer.to(dtype=dtype)
++
++
++def _initialize_significand_runtime() -> None:
++    try:
++        from vllm.model_executor.models.significand_runtime import (
++            initialize_significand_runtime,
++        )
++
++        initialize_significand_runtime()
++    except ImportError:
++        return
++
++
+ class BaseModelLoader(ABC):
+     """Base class for model loaders."""
+ 
+@@ -50,13 +92,16 @@ class BaseModelLoader(ABC):
+             device_config.device if load_config.device is None else load_config.device
+         )
+         target_device = torch.device(load_device)
+-        with set_default_torch_dtype(model_config.dtype):
++        _initialize_significand_runtime()
++        init_dtype = _layercast_model_init_dtype(model_config.dtype)
++        with set_default_torch_dtype(init_dtype):
+             with target_device:
+                 model = initialize_model(
+                     vllm_config=vllm_config,
+                     model_config=model_config,
+                     prefix=prefix,
+                 )
++            _restore_layercast_buffer_dtype(model, model_config.dtype)
+ 
+             log_model_inspection(model)
+ 
+diff --git a/vllm/model_executor/models/layercast_runtime.py b/vllm/model_executor/models/layercast_runtime.py
+new file mode 100644
+index 000000000..1c76441d5
+--- /dev/null
++++ b/vllm/model_executor/models/layercast_runtime.py
+@@ -0,0 +1,36 @@
++# SPDX-License-Identifier: Apache-2.0
++"""LayerCast runtime gates for local tensor-dump experiments."""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++
++def _env_enabled(name: str) -> bool:
++    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
++
++
++def _configure_float32_matmul_precision() -> None:
++    raw_precision = os.environ.get("VLLM_FLOAT32_MATMUL_PRECISION")
++    raw_tf32 = os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE")
++    if raw_precision:
++        try:
++            torch.set_float32_matmul_precision(raw_precision)
++        except Exception:
++            pass
++    if raw_tf32 is not None:
++        try:
++            allow_tf32 = raw_tf32.lower() in {"1", "true", "yes", "on"}
++            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
++            torch.backends.cudnn.allow_tf32 = allow_tf32
++        except Exception:
++            pass
++
++
++_configure_float32_matmul_precision()
++
++
++def layercast_enabled() -> bool:
++    return _env_enabled("VLLM_LAYERCAST_FORCE_FP32")
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 2ecced3df..d24e61700 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -76,6 +76,9 @@ from .utils import (
+     make_layers,
+     maybe_prefix,
+ )
++from .tensor_trace import (
++    record_dump_tensor as _trace_dump,
++)
+ 
+ 
+ class LlamaMLP(nn.Module):
+@@ -91,6 +94,8 @@ class LlamaMLP(nn.Module):
+         disable_tp: bool = False,
+     ) -> None:
+         super().__init__()
++        self._stage_prefix = prefix or self.__class__.__name__
++        self.layer_idx = extract_layer_index(prefix)
+         self.gate_up_proj = MergedColumnParallelLinear(
+             input_size=hidden_size,
+             output_sizes=[intermediate_size] * 2,
+@@ -116,8 +121,19 @@ class LlamaMLP(nn.Module):
+ 
+     def forward(self, x):
+         x, _ = self.gate_up_proj(x)
++        x = _trace_dump(
++            "everything", f"layer_{self.layer_idx}.mlp.gate_up_proj.output", x
++        )
+         x = self.act_fn(x)
++        x = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.mlp.silu_and_mul.output",
++            x,
++        )
+         x, _ = self.down_proj(x)
++        x = _trace_dump(
++            "everything", f"layer_{self.layer_idx}.mlp.down_proj.output", x
++        )
+         return x
+ 
+ 
+@@ -138,6 +154,8 @@ class LlamaAttention(nn.Module):
+     ) -> None:
+         super().__init__()
+         layer_idx = extract_layer_index(prefix)
++        self.layer_idx = layer_idx
++        self._stage_prefix = prefix or self.__class__.__name__
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -227,9 +245,42 @@ class LlamaAttention(nn.Module):
+     ) -> torch.Tensor:
+         qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++        q = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.qkv_proj.output.q",
++            q,
++        )
++        k = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.qkv_proj.output.k",
++            k,
++        )
++        v = _trace_dump(
++            "qkv",
++            f"layer_{self.layer_idx}.self_attn.qkv_proj.output.v",
++            v,
++        )
+         q, k = self.rotary_emb(positions, q, k)
++        q = _trace_dump(
++            "qkv",
++            f"layer_{self.layer_idx}.self_attn.rotary_emb.output.q",
++            q,
++        )
++        k = _trace_dump(
++            "qkv",
++            f"layer_{self.layer_idx}.self_attn.rotary_emb.output.k",
++            k,
++        )
+         attn_output = self.attn(q, k, v)
++        attn_output = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.attention.output",
++            attn_output,
++        )
+         output, _ = self.o_proj(attn_output)
++        output = _trace_dump(
++            "everything", f"layer_{self.layer_idx}.self_attn.o_proj.output", output
++        )
+         return output
+ 
+     def _init_rotary_emb(
+@@ -265,6 +316,7 @@ class LlamaDecoderLayer(nn.Module):
+         quant_config = self.get_quant_config(vllm_config)
+ 
+         self.hidden_size = config.hidden_size
++        self._stage_prefix = prefix or self.__class__.__name__
+         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+         # Support abacusai/Smaug-72B-v0.1 with attention_bias
+         # Support internlm/internlm-7b with bias
+@@ -312,6 +364,7 @@ class LlamaDecoderLayer(nn.Module):
+         self.post_attention_layernorm = RMSNorm(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
++        self.layer_idx = extract_layer_index(prefix)
+ 
+     def forward(
+         self,
+@@ -323,12 +376,37 @@ class LlamaDecoderLayer(nn.Module):
+         if residual is None:
+             residual = hidden_states
+             hidden_states = self.input_layernorm(hidden_states)
++            hidden_states = _trace_dump(
++                "everything",
++                f"layer_{self.layer_idx}.input_layernorm.output.hidden",
++                hidden_states,
++            )
+         else:
+             hidden_states, residual = self.input_layernorm(hidden_states, residual)
++            hidden_states = _trace_dump(
++                "everything",
++                f"layer_{self.layer_idx}.input_layernorm.output.hidden",
++                hidden_states,
++            )
++            residual = _trace_dump(
++                "everything",
++                f"layer_{self.layer_idx}.input_layernorm.output.residual",
++                residual,
++            )
+         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        hidden_states = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.post_attention_layernorm.output.hidden",
++            hidden_states,
++        )
++        residual = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.post_attention_layernorm.output.residual",
++            residual,
++        )
+         hidden_states = self.mlp(hidden_states)
+         return hidden_states, residual
+ 
+@@ -367,6 +445,7 @@ class LlamaModel(nn.Module, EagleModelMixin):
+ 
+         self.config = config
+         self.quant_config = quant_config
++        self._stage_prefix = prefix or self.__class__.__name__
+ 
+         self.vocab_size = config.vocab_size
+ 
+@@ -395,7 +474,12 @@ class LlamaModel(nn.Module, EagleModelMixin):
+         )
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+-        return self.embed_tokens(input_ids)
++        hidden_states = self.embed_tokens(input_ids)
++        return _trace_dump(
++            "everything",
++            "forward.embed_tokens.output",
++            hidden_states,
++        )
+ 
+     def forward(
+         self,
+@@ -430,9 +514,12 @@ class LlamaModel(nn.Module, EagleModelMixin):
+         if not get_pp_group().is_last_rank:
+             return IntermediateTensors(
+                 {"hidden_states": hidden_states, "residual": residual}
+-            )
++        )
+ 
+         hidden_states, _ = self.norm(hidden_states, residual)
++        hidden_states = _trace_dump(
++            "everything", "forward.norm.hidden", hidden_states
++        )
+ 
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+@@ -528,6 +615,7 @@ class LlamaForCausalLM(
+         config = vllm_config.model_config.hf_config
+         quant_config = vllm_config.quant_config
+         self.config = config
++        self._lm_head_stage_prefix = maybe_prefix(prefix, "lm_head")
+ 
+         self.model = self._init_model(
+             vllm_config=vllm_config,
+@@ -544,11 +632,13 @@ class LlamaForCausalLM(
+             )
+             if config.tie_word_embeddings:
+                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
++            self.lm_head._vllm_lm_head_output_stage = "lm_head.linear.logits"
+ 
+             logit_scale = getattr(config, "logit_scale", 1.0)
+             self.logits_processor = LogitsProcessor(
+                 config.vocab_size, scale=logit_scale
+             )
++            self.logits_processor._vllm_final_logits_stage = "forward.logits"
+         else:
+             self.lm_head = PPMissingLayer()
+ 
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 27aa6175b..d33c66da3 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -78,6 +78,9 @@ from .utils import (
+     make_layers,
+     maybe_prefix,
+ )
++from .tensor_trace import (
++    record_dump_tensor as _trace_dump,
++)
+ 
+ 
+ class Qwen2MLP(nn.Module):
+@@ -90,6 +93,8 @@ class Qwen2MLP(nn.Module):
+         prefix: str = "",
+     ) -> None:
+         super().__init__()
++        self._stage_prefix = prefix or self.__class__.__name__
++        self.layer_idx = extract_layer_index(prefix)
+         self.gate_up_proj = MergedColumnParallelLinear(
+             hidden_size,
+             [intermediate_size] * 2,
+@@ -112,8 +117,21 @@ class Qwen2MLP(nn.Module):
+ 
+     def forward(self, x):
+         gate_up, _ = self.gate_up_proj(x)
++        gate_up = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.mlp.gate_up_proj.output",
++            gate_up,
++        )
+         x = self.act_fn(gate_up)
++        x = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.mlp.silu_and_mul.output",
++            x,
++        )
+         x, _ = self.down_proj(x)
++        x = _trace_dump(
++            "everything", f"layer_{self.layer_idx}.mlp.down_proj.output", x
++        )
+         return x
+ 
+ 
+@@ -134,6 +152,8 @@ class Qwen2Attention(nn.Module):
+         rms_norm_eps: float = 1e-6,
+     ) -> None:
+         super().__init__()
++        self.layer_idx = extract_layer_index(prefix)
++        self._stage_prefix = prefix or self.__class__.__name__
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -213,6 +233,21 @@ class Qwen2Attention(nn.Module):
+     ) -> torch.Tensor:
+         qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++        q = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.qkv_proj.output.q",
++            q,
++        )
++        k = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.qkv_proj.output.k",
++            k,
++        )
++        v = _trace_dump(
++            "qkv",
++            f"layer_{self.layer_idx}.self_attn.qkv_proj.output.v",
++            v,
++        )
+ 
+         # Apply QK normalization if enabled (before RoPE)
+         if self.qk_norm:
+@@ -224,15 +259,39 @@ class Qwen2Attention(nn.Module):
+ 
+             # Apply normalization
+             q = self.q_norm(q)
++            q = _trace_dump(
++                "everything", f"layer_{self.layer_idx}.self_attn.q_norm.output", q
++            )
+             k = self.k_norm(k)
++            k = _trace_dump(
++                "everything", f"layer_{self.layer_idx}.self_attn.k_norm.output", k
++            )
+ 
+             # Reshape back
+             q = q.view(total_tokens, self.q_size)
+             k = k.view(total_tokens, self.kv_size)
+ 
+         q, k = self.rotary_emb(positions, q, k)
++        q = _trace_dump(
++            "qkv",
++            f"layer_{self.layer_idx}.self_attn.rotary_emb.output.q",
++            q,
++        )
++        k = _trace_dump(
++            "qkv",
++            f"layer_{self.layer_idx}.self_attn.rotary_emb.output.k",
++            k,
++        )
+         attn_output = self.attn(q, k, v)
++        attn_output = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.attention.output",
++            attn_output,
++        )
+         output, _ = self.o_proj(attn_output)
++        output = _trace_dump(
++            "everything", f"layer_{self.layer_idx}.self_attn.o_proj.output", output
++        )
+         return output
+ 
+ 
+@@ -246,6 +305,7 @@ class Qwen2DecoderLayer(nn.Module):
+     ) -> None:
+         super().__init__()
+         self.hidden_size = config.hidden_size
++        self._stage_prefix = prefix or self.__class__.__name__
+         set_default_rope_theta(config, default_theta=1000000)
+         dual_chunk_attention_config = getattr(
+             config, "dual_chunk_attention_config", None
+@@ -288,6 +348,7 @@ class Qwen2DecoderLayer(nn.Module):
+         self.post_attention_layernorm = RMSNorm(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
++        self.layer_idx = extract_layer_index(prefix)
+ 
+     def forward(
+         self,
+@@ -299,8 +360,23 @@ class Qwen2DecoderLayer(nn.Module):
+         if residual is None:
+             residual = hidden_states
+             hidden_states = self.input_layernorm(hidden_states)
++            hidden_states = _trace_dump(
++                "everything",
++                f"layer_{self.layer_idx}.input_layernorm.output.hidden",
++                hidden_states,
++            )
+         else:
+             hidden_states, residual = self.input_layernorm(hidden_states, residual)
++            hidden_states = _trace_dump(
++                "everything",
++                f"layer_{self.layer_idx}.input_layernorm.output.hidden",
++                hidden_states,
++            )
++            residual = _trace_dump(
++                "everything",
++                f"layer_{self.layer_idx}.input_layernorm.output.residual",
++                residual,
++            )
+         hidden_states = self.self_attn(
+             positions=positions,
+             hidden_states=hidden_states,
+@@ -308,6 +384,16 @@ class Qwen2DecoderLayer(nn.Module):
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        hidden_states = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.post_attention_layernorm.output.hidden",
++            hidden_states,
++        )
++        residual = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.post_attention_layernorm.output.residual",
++            residual,
++        )
+         hidden_states = self.mlp(hidden_states)
+         return hidden_states, residual
+ 
+@@ -383,6 +469,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+ 
+         self.config = config
+         self.quant_config = quant_config
++        self._stage_prefix = prefix or self.__class__.__name__
+         self.vocab_size = config.vocab_size
+ 
+         if get_pp_group().is_first_rank or (
+@@ -417,7 +504,12 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+             self.norm = PPMissingLayer()
+ 
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+-        return self.embed_tokens(input_ids)
++        hidden_states = self.embed_tokens(input_ids)
++        return _trace_dump(
++            "everything",
++            "forward.embed_tokens.output",
++            hidden_states,
++        )
+ 
+     def forward(
+         self,
+@@ -452,6 +544,9 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+             )
+ 
+         hidden_states, _ = self.norm(hidden_states, residual)
++        hidden_states = _trace_dump(
++            "everything", "forward.norm.hidden", hidden_states
++        )
+ 
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+@@ -547,6 +642,7 @@ class Qwen2ForCausalLM(
+         self.config = config
+ 
+         self.quant_config = quant_config
++        self._lm_head_stage_prefix = maybe_prefix(prefix, "lm_head")
+         self.model = Qwen2Model(
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+         )
+@@ -561,10 +657,12 @@ class Qwen2ForCausalLM(
+                     quant_config=quant_config,
+                     prefix=maybe_prefix(prefix, "lm_head"),
+                 )
++            self.lm_head._vllm_lm_head_output_stage = "lm_head.linear.logits"
+         else:
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        self.logits_processor._vllm_final_logits_stage = "forward.logits"
+ 
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+diff --git a/vllm/model_executor/models/qwen3.py b/vllm/model_executor/models/qwen3.py
+index 91931f9f4..07f1f1027 100644
+--- a/vllm/model_executor/models/qwen3.py
++++ b/vllm/model_executor/models/qwen3.py
+@@ -49,6 +49,9 @@ from vllm.transformers_utils.config import set_default_rope_theta
+ from vllm.v1.attention.backend import AttentionType
+ 
+ from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
++from .tensor_trace import (
++    record_dump_tensor as _trace_dump,
++)
+ from .qwen2 import Qwen2MLP as Qwen3MLP
+ from .qwen2 import Qwen2Model
+ from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
+@@ -74,6 +77,8 @@ class Qwen3Attention(nn.Module):
+         dual_chunk_attention_config: dict[str, Any] | None = None,
+     ) -> None:
+         super().__init__()
++        self.layer_idx = extract_layer_index(prefix)
++        self._stage_prefix = prefix or self.__class__.__name__
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -149,16 +154,59 @@ class Qwen3Attention(nn.Module):
+     ) -> torch.Tensor:
+         qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++        q = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.qkv_proj.output.q",
++            q,
++        )
++        k = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.qkv_proj.output.k",
++            k,
++        )
++        v = _trace_dump(
++            "qkv",
++            f"layer_{self.layer_idx}.self_attn.qkv_proj.output.v",
++            v,
++        )
+         # Add qk-norm
+         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+         q_by_head = self.q_norm(q_by_head)
++        q_by_head = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.q_norm.output",
++            q_by_head,
++        )
+         q = q_by_head.view(q.shape)
+         k_by_head = k.view(*k.shape[:-1], k.shape[-1] // self.head_dim, self.head_dim)
+         k_by_head = self.k_norm(k_by_head)
++        k_by_head = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.k_norm.output",
++            k_by_head,
++        )
+         k = k_by_head.view(k.shape)
+         q, k = self.rotary_emb(positions, q, k)
++        q = _trace_dump(
++            "qkv",
++            f"layer_{self.layer_idx}.self_attn.rotary_emb.output.q",
++            q,
++        )
++        k = _trace_dump(
++            "qkv",
++            f"layer_{self.layer_idx}.self_attn.rotary_emb.output.k",
++            k,
++        )
+         attn_output = self.attn(q, k, v)
++        attn_output = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.self_attn.attention.output",
++            attn_output,
++        )
+         output, _ = self.o_proj(attn_output)
++        output = _trace_dump(
++            "everything", f"layer_{self.layer_idx}.self_attn.o_proj.output", output
++        )
+         return output
+ 
+ 
+@@ -172,6 +220,7 @@ class Qwen3DecoderLayer(nn.Module):
+     ) -> None:
+         super().__init__()
+         self.hidden_size = config.hidden_size
++        self._stage_prefix = prefix or self.__class__.__name__
+         set_default_rope_theta(config, default_theta=1000000)
+         dual_chunk_attention_config = getattr(
+             config, "dual_chunk_attention_config", None
+@@ -212,6 +261,7 @@ class Qwen3DecoderLayer(nn.Module):
+         self.post_attention_layernorm = RMSNorm(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
++        self.layer_idx = extract_layer_index(prefix)
+ 
+     def forward(
+         self,
+@@ -223,8 +273,23 @@ class Qwen3DecoderLayer(nn.Module):
+         if residual is None:
+             residual = hidden_states
+             hidden_states = self.input_layernorm(hidden_states)
++            hidden_states = _trace_dump(
++                "everything",
++                f"layer_{self.layer_idx}.input_layernorm.output.hidden",
++                hidden_states,
++            )
+         else:
+             hidden_states, residual = self.input_layernorm(hidden_states, residual)
++            hidden_states = _trace_dump(
++                "everything",
++                f"layer_{self.layer_idx}.input_layernorm.output.hidden",
++                hidden_states,
++            )
++            residual = _trace_dump(
++                "everything",
++                f"layer_{self.layer_idx}.input_layernorm.output.residual",
++                residual,
++            )
+         hidden_states = self.self_attn(
+             positions=positions,
+             hidden_states=hidden_states,
+@@ -232,6 +297,16 @@ class Qwen3DecoderLayer(nn.Module):
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        hidden_states = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.post_attention_layernorm.output.hidden",
++            hidden_states,
++        )
++        residual = _trace_dump(
++            "everything",
++            f"layer_{self.layer_idx}.post_attention_layernorm.output.residual",
++            residual,
++        )
+         hidden_states = self.mlp(hidden_states)
+         return hidden_states, residual
+ 
+@@ -286,6 +361,7 @@ class Qwen3ForCausalLM(
+         self.config = config
+ 
+         self.quant_config = quant_config
++        self._lm_head_stage_prefix = maybe_prefix(prefix, "lm_head")
+         self.model = Qwen3Model(
+             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+         )
+@@ -300,10 +376,12 @@ class Qwen3ForCausalLM(
+                     quant_config=quant_config,
+                     prefix=maybe_prefix(prefix, "lm_head"),
+                 )
++            self.lm_head._vllm_lm_head_output_stage = "lm_head.linear.logits"
+         else:
+             self.lm_head = PPMissingLayer()
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
++        self.logits_processor._vllm_final_logits_stage = "forward.logits"
+ 
+         self.make_empty_intermediate_tensors = (
+             self.model.make_empty_intermediate_tensors
+diff --git a/vllm/model_executor/models/significand_runtime.py b/vllm/model_executor/models/significand_runtime.py
+new file mode 100644
+index 000000000..9c66d57ba
+--- /dev/null
++++ b/vllm/model_executor/models/significand_runtime.py
+@@ -0,0 +1,409 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Significand-rounding hooks for local experiments.
++
++The rounding intervention is env-gated, while the implementation version always
++uses the full FP32 LayerCast workflow for the significand sweep.
++"""
++
++from __future__ import annotations
++
++import os
++import math
++import logging
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_SIGNIFICAND_BITS_MIN = 3
++_SIGNIFICAND_BITS_MAX = 23
++_VALID_BOUNDARY_SETS = frozenset(
++    {
++        "all",
++        "linear_outputs",
++        "embedding_outputs",
++        "rmsnorm_outputs",
++        "activation_outputs",
++        "operator_outputs",
++        "attention_qk",
++        "attention_qkv",
++        "attention_v",
++        "attention_outputs",
++        "attention_boundaries",
++    }
++)
++
++
++def _configure_float32_matmul_precision() -> None:
++    os.environ["VLLM_LAYERCAST_FORCE_FP32"] = "1"
++    os.environ["VLLM_FLOAT32_MATMUL_PRECISION"] = "highest"
++    os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "0"
++    try:
++        torch.set_float32_matmul_precision("highest")
++    except Exception:
++        pass
++    try:
++        torch.backends.cuda.matmul.allow_tf32 = False
++        torch.backends.cudnn.allow_tf32 = False
++    except Exception:
++        pass
++
++
++def _parse_significand_bits() -> int | None:
++    raw = os.environ.get("VLLM_SIGNIFICAND_BITS")
++    if raw is None:
++        return None
++    try:
++        bits = int(raw)
++    except ValueError:
++        raise ValueError(
++            "VLLM_SIGNIFICAND_BITS must be an integer in the range "
++            f"[{_SIGNIFICAND_BITS_MIN}, {_SIGNIFICAND_BITS_MAX}]"
++        ) from None
++    if bits < _SIGNIFICAND_BITS_MIN or bits > _SIGNIFICAND_BITS_MAX:
++        raise ValueError(
++            "VLLM_SIGNIFICAND_BITS must be in the range "
++            f"[{_SIGNIFICAND_BITS_MIN}, {_SIGNIFICAND_BITS_MAX}]"
++        )
++    return bits
++
++
++_SIGNIFICAND_BITS = _parse_significand_bits()
++
++
++def _parse_skip_channel_percent() -> float:
++    raw = os.environ.get("VLLM_SIGNIFICAND_SKIP_CHANNEL_PERCENT")
++    if raw is None:
++        return 0.0
++    percent = float(raw)
++    if percent < 0.0 or percent > 100.0:
++        raise ValueError(
++            "VLLM_SIGNIFICAND_SKIP_CHANNEL_PERCENT must be in the range [0, 100]"
++        )
++    return percent
++
++
++_SKIP_CHANNEL_FILE = os.environ.get("VLLM_SIGNIFICAND_SKIP_CHANNEL_FILE", "")
++_SKIP_CHANNEL_PERCENT = _parse_skip_channel_percent()
++_SKIP_CHANNEL_METRIC = os.environ.get(
++    "VLLM_SIGNIFICAND_SKIP_CHANNEL_METRIC", "absmax"
++).lower()
++if _SKIP_CHANNEL_METRIC in {"max", "abs_max"}:
++    _SKIP_CHANNEL_METRIC = "absmax"
++if _SKIP_CHANNEL_METRIC in {"sqmean", "mean_square"}:
++    _SKIP_CHANNEL_METRIC = "mean_square"
++if _SKIP_CHANNEL_METRIC not in {"absmax", "mean_square", "square_sum"}:
++    raise ValueError(
++        "VLLM_SIGNIFICAND_SKIP_CHANNEL_METRIC must be 'absmax', "
++        "'mean_square', or 'square_sum'"
++    )
++_SKIP_CHANNEL_MASKS: dict[str, torch.Tensor] | None = None
++_SKIP_CHANNEL_DEVICE_MASKS: dict[tuple[str, torch.device], torch.Tensor] = {}
++
++
++def _parse_boundary_sets() -> frozenset[str]:
++    raw = os.environ.get("VLLM_SIGNIFICAND_BOUNDARY_SET", "all")
++    normalized = raw.lower().replace("+", ",").replace(";", ",").replace(" ", ",")
++    values = frozenset(value for value in normalized.split(",") if value)
++    values = values or frozenset({"all"})
++    unknown = values - _VALID_BOUNDARY_SETS
++    if unknown:
++        raise ValueError(
++            "Unknown VLLM_SIGNIFICAND_BOUNDARY_SET values: "
++            f"{', '.join(sorted(unknown))}. Valid values are: "
++            f"{', '.join(sorted(_VALID_BOUNDARY_SETS))}"
++        )
++    return values
++
++
++_BOUNDARY_SETS = _parse_boundary_sets()
++
++
++def _boundary_set_matches(*names: str) -> bool:
++    return bool(_BOUNDARY_SETS & set(names))
++
++
++def _is_layer_boundary(name: str, suffix: str) -> bool:
++    if not name.endswith(f".{suffix}") or not name.startswith("layer_"):
++        return False
++    layer_id, separator, _ = name[len("layer_"):].partition(".")
++    return bool(separator) and layer_id.isdigit()
++
++
++def _is_linear_output(name: str) -> bool:
++    return (
++        any(
++            _is_layer_boundary(name, suffix)
++            for suffix in (
++                "mlp.gate_up_proj.output",
++                "mlp.down_proj.output",
++                "self_attn.o_proj.output",
++                "self_attn.qkv_proj.output.q",
++                "self_attn.qkv_proj.output.k",
++                "self_attn.qkv_proj.output.v",
++            )
++        )
++        or name == "lm_head.linear.logits"
++    )
++
++
++def _is_embedding_output(name: str) -> bool:
++    return name == "forward.embed_tokens.output"
++
++
++def _is_rmsnorm_output(name: str) -> bool:
++    return (
++        name == "forward.norm.hidden"
++        or _is_layer_boundary(name, "input_layernorm.output.hidden")
++        or _is_layer_boundary(name, "input_layernorm.output.residual")
++        or _is_layer_boundary(name, "post_attention_layernorm.output.hidden")
++        or _is_layer_boundary(name, "post_attention_layernorm.output.residual")
++        or _is_layer_boundary(name, "self_attn.q_norm.output")
++        or _is_layer_boundary(name, "self_attn.k_norm.output")
++    )
++
++
++def _is_activation_output(name: str) -> bool:
++    return _is_layer_boundary(name, "mlp.silu_and_mul.output")
++
++
++def _is_attention_boundary(name: str, suffix: str) -> bool:
++    return _is_layer_boundary(name, suffix)
++
++
++def _is_attention_q_boundary(name: str) -> bool:
++    return _is_attention_boundary(name, "self_attn.qkv_proj.output.q")
++
++
++def _is_attention_k_boundary(name: str) -> bool:
++    return _is_attention_boundary(name, "self_attn.qkv_proj.output.k")
++
++
++def _is_attention_v_boundary(name: str) -> bool:
++    return _is_attention_boundary(name, "self_attn.qkv_proj.output.v")
++
++
++def _is_attention_output_boundary(name: str) -> bool:
++    return _is_attention_boundary(name, "self_attn.attention.output")
++
++
++def _is_rotary_q_boundary(name: str) -> bool:
++    return _is_attention_boundary(name, "self_attn.rotary_emb.output.q")
++
++
++def _is_rotary_k_boundary(name: str) -> bool:
++    return _is_attention_boundary(name, "self_attn.rotary_emb.output.k")
++
++
++def _is_rotary_output(name: str) -> bool:
++    return _is_rotary_q_boundary(name) or _is_rotary_k_boundary(name)
++
++
++def _is_final_logits_output(name: str) -> bool:
++    return name == "forward.logits"
++
++
++def _is_known_boundary(name: str) -> bool:
++    return (
++        _is_linear_output(name)
++        or _is_embedding_output(name)
++        or _is_rmsnorm_output(name)
++        or _is_activation_output(name)
++        or _is_rotary_output(name)
++        or _is_attention_output_boundary(name)
++        or _is_final_logits_output(name)
++    )
++
++
++def _env_enabled(name: str) -> bool:
++    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
++
++
++def layercast_enabled() -> bool:
++    return _env_enabled("VLLM_LAYERCAST_FORCE_FP32")
++
++
++def significand_rounding_enabled() -> bool:
++    return _SIGNIFICAND_BITS is not None and _SIGNIFICAND_BITS < 23
++
++
++def _pick_sorted_indices(row: object) -> torch.Tensor | None:
++    if not isinstance(row, dict):
++        return None
++    candidate_keys = (
++        f"{_SKIP_CHANNEL_METRIC}_indices",
++        f"rank_{_SKIP_CHANNEL_METRIC}_desc",
++        f"{_SKIP_CHANNEL_METRIC}_desc_indices",
++    )
++    for key in candidate_keys:
++        indices = row.get(key)
++        if torch.is_tensor(indices):
++            return indices.to(torch.long).reshape(-1).cpu()
++    values = row.get(_SKIP_CHANNEL_METRIC)
++    if torch.is_tensor(values):
++        return torch.argsort(values.reshape(-1).to(torch.float32), descending=True).cpu()
++    return None
++
++
++def _load_skip_channel_masks() -> dict[str, torch.Tensor]:
++    if not _SKIP_CHANNEL_FILE or _SKIP_CHANNEL_PERCENT <= 0.0:
++        return {}
++    payload = torch.load(_SKIP_CHANNEL_FILE, map_location="cpu")
++    if isinstance(payload, dict) and "stats" in payload:
++        payload = payload["stats"]
++    if not isinstance(payload, dict):
++        raise ValueError("significand skip-channel file must contain a dict payload")
++
++    masks: dict[str, torch.Tensor] = {}
++    unknown_names: list[str] = []
++    for name, row in payload.items():
++        stage = str(name)
++        if not _is_known_boundary(stage):
++            unknown_names.append(stage)
++            continue
++        indices = _pick_sorted_indices(row)
++        if indices is None or indices.numel() == 0:
++            continue
++        count = int(indices.numel())
++        keep = int(math.ceil(count * _SKIP_CHANNEL_PERCENT / 100.0))
++        if keep <= 0:
++            continue
++        mask = torch.zeros(count, dtype=torch.bool)
++        mask[indices[:keep]] = True
++        masks[stage] = mask
++    if unknown_names:
++        preview = ", ".join(sorted(unknown_names)[:8])
++        suffix = "" if len(unknown_names) <= 8 else f", ... (+{len(unknown_names) - 8})"
++        logger.warning(
++            "Ignoring %d unknown stage names in significand skip-channel file %s: %s%s",
++            len(unknown_names),
++            _SKIP_CHANNEL_FILE,
++            preview,
++            suffix,
++        )
++    if not masks:
++        raise ValueError(
++            "VLLM_SIGNIFICAND_SKIP_CHANNEL_PERCENT is greater than 0 but no "
++            "usable canonical boundary masks were loaded from "
++            f"{_SKIP_CHANNEL_FILE!r}"
++        )
++    return masks
++
++
++def initialize_significand_runtime() -> None:
++    global _SKIP_CHANNEL_MASKS
++    if "VLLM_SIGNIFICAND_BITS" not in os.environ:
++        return
++    _configure_float32_matmul_precision()
++    if _SKIP_CHANNEL_MASKS is None:
++        _SKIP_CHANNEL_MASKS = _load_skip_channel_masks()
++
++
++def _skip_channel_mask(name: str, x: torch.Tensor) -> torch.Tensor | None:
++    if _SKIP_CHANNEL_MASKS is None:
++        return None
++    mask = _SKIP_CHANNEL_MASKS.get(name)
++    if mask is None:
++        if _SKIP_CHANNEL_FILE and _SKIP_CHANNEL_PERCENT > 0.0:
++            raise ValueError(
++                "Missing skip-channel outlier stats for rounded boundary "
++                f"{name!r} in {_SKIP_CHANNEL_FILE!r}"
++            )
++        return None
++    if mask.numel() != x.shape[-1]:
++        if _SKIP_CHANNEL_FILE and _SKIP_CHANNEL_PERCENT > 0.0:
++            raise ValueError(
++                "Skip-channel mask width mismatch for boundary "
++                f"{name!r}: mask has {mask.numel()} channels but tensor has "
++                f"{x.shape[-1]}"
++            )
++        return None
++    key = (name, x.device)
++    device_mask = _SKIP_CHANNEL_DEVICE_MASKS.get(key)
++    if device_mask is None:
++        device_mask = mask.to(device=x.device)
++        _SKIP_CHANNEL_DEVICE_MASKS[key] = device_mask
++    return device_mask.view(*([1] * (x.ndim - 1)), device_mask.numel())
++
++
++def _boundary_enabled(name: str) -> bool:
++    if "all" in _BOUNDARY_SETS:
++        return _is_known_boundary(name)
++    if _boundary_set_matches("operator_outputs"):
++        if (
++            _is_linear_output(name)
++            or _is_embedding_output(name)
++            or _is_rmsnorm_output(name)
++            or _is_activation_output(name)
++            or _is_rotary_output(name)
++            or _is_final_logits_output(name)
++        ):
++            return True
++    if _boundary_set_matches("linear_outputs"):
++        if _is_linear_output(name):
++            return True
++    if _boundary_set_matches("embedding_outputs"):
++        if _is_embedding_output(name):
++            return True
++    if _boundary_set_matches("rmsnorm_outputs"):
++        if _is_rmsnorm_output(name):
++            return True
++    if _boundary_set_matches("activation_outputs"):
++        if _is_activation_output(name):
++            return True
++    if _boundary_set_matches("attention_boundaries"):
++        if (
++            _is_attention_q_boundary(name)
++            or _is_attention_k_boundary(name)
++            or _is_attention_v_boundary(name)
++            or _is_rotary_output(name)
++            or _is_attention_output_boundary(name)
++        ):
++            return True
++    if _boundary_set_matches("attention_qkv"):
++        if (
++            _is_attention_q_boundary(name)
++            or _is_attention_k_boundary(name)
++            or _is_attention_v_boundary(name)
++        ):
++            return True
++    if _boundary_set_matches("attention_qk"):
++        if (
++            _is_attention_q_boundary(name)
++            or _is_attention_k_boundary(name)
++            or _is_rotary_output(name)
++        ):
++            return True
++    if _boundary_set_matches("attention_v"):
++        if _is_attention_v_boundary(name):
++            return True
++    if _boundary_set_matches("attention_outputs"):
++        if _is_attention_output_boundary(name):
++            return True
++    return False
++
++
++def significand_round_boundary(name: str, x: torch.Tensor) -> torch.Tensor:
++    if not torch.is_floating_point(x):
++        return x
++
++    bits = _SIGNIFICAND_BITS
++    if (
++        bits is None
++        or bits >= 23
++        or not _boundary_enabled(name)
++    ):
++        return x
++
++    original_dtype = x.dtype
++    y = x if x.dtype == torch.float32 else x.to(torch.float32)
++
++    finite_nonzero = torch.isfinite(y) & (y != 0)
++    mantissa, exponent = torch.frexp(y)
++    scale = 2.0 ** (bits + 1)
++    rounded = torch.ldexp(torch.round(mantissa * scale) / scale, exponent)
++    rounded = torch.where(finite_nonzero, rounded, y)
++    skip_mask = _skip_channel_mask(name, y)
++    if skip_mask is not None:
++        rounded = torch.where(skip_mask, y, rounded)
++    return rounded.to(original_dtype)
+diff --git a/vllm/model_executor/models/tensor_trace.py b/vllm/model_executor/models/tensor_trace.py
+new file mode 100644
+index 000000000..cbaafceef
+--- /dev/null
++++ b/vllm/model_executor/models/tensor_trace.py
+@@ -0,0 +1,336 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Small env-gated tensor tracing hooks for local precision benchmarks."""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++from collections.abc import Iterable
++from pathlib import Path
++
++import torch
++from safetensors.torch import save_file
++
++_TENSORS: dict[str, list[torch.Tensor]] = {}
++_OUTLIER_STATS: dict[str, dict[str, torch.Tensor | int]] = {}
++_DUMP_MODE_CHOICES = {"everything", "qkv", "outlier"}
++_TOKEN_INDEX_FILTER_OVERRIDE: tuple[bool, tuple[int, ...]] | None = None
++_ROW_FILTER_WARNED: set[str] = set()
++
++
++def _tensor_file() -> str:
++    return os.environ.get("TENSOR_TRACE_TENSOR_FILE") or os.environ.get(
++        "VLLM_TENSOR_TRACE_TENSOR_FILE", ""
++    )
++
++
++def tensor_trace_enabled() -> bool:
++    return bool(_tensor_file())
++
++
++def _stage_enabled(stage: str) -> bool:
++    pattern = os.environ.get("TENSOR_TRACE_STAGE_REGEX") or os.environ.get(
++        "VLLM_TENSOR_TRACE_STAGE_REGEX", ""
++    )
++    if not pattern:
++        return True
++    return re.search(pattern, stage) is not None
++
++
++def _parse_token_index_filter(
++    value: str | Iterable[int],
++    *,
++    source: str,
++) -> tuple[bool, tuple[int, ...]]:
++    token_indices = []
++    seen = set()
++    if isinstance(value, str):
++        raw_items = re.split(r"[,;+\s]+", value.strip())
++    else:
++        raw_items = list(value)
++
++    for item in raw_items:
++        if item == "":
++            continue
++        try:
++            token_index = int(item)
++        except (TypeError, ValueError) as exc:
++            raise ValueError(
++                f"{source} must be a comma/space-separated list or iterable "
++                f"of integer token row indices; got {item!r}"
++            ) from exc
++        if token_index < 0:
++            raise ValueError(f"{source} does not support negative indices")
++        if token_index in seen:
++            continue
++        seen.add(token_index)
++        token_indices.append(token_index)
++    return True, tuple(token_indices)
++
++
++def set_tensor_trace_token_index_filter(
++    token_indices: str | Iterable[int] | None,
++) -> None:
++    """Set the optional token-row filter from runner/external code.
++
++    Indices are zero-based over each captured tensor's first dimension.
++    ``None`` disables row filtering. An empty string/list keeps the filter
++    enabled but records no token rows.
++    """
++
++    global _TOKEN_INDEX_FILTER_OVERRIDE
++    if token_indices is None:
++        _TOKEN_INDEX_FILTER_OVERRIDE = (False, ())
++        return
++    _TOKEN_INDEX_FILTER_OVERRIDE = _parse_token_index_filter(
++        token_indices,
++        source="set_tensor_trace_token_index_filter",
++    )
++
++
++def clear_tensor_trace_token_index_filter_override() -> None:
++    global _TOKEN_INDEX_FILTER_OVERRIDE
++    _TOKEN_INDEX_FILTER_OVERRIDE = None
++
++
++def _token_index_filter() -> tuple[bool, tuple[int, ...]]:
++    if _TOKEN_INDEX_FILTER_OVERRIDE is not None:
++        return _TOKEN_INDEX_FILTER_OVERRIDE
++    for env_name in (
++        "VLLM_DUMP_TENSORS_TOKEN_INDICES",
++        "TENSOR_TRACE_TOKEN_INDICES",
++        "VLLM_TENSOR_TRACE_TOKEN_INDICES",
++    ):
++        if env_name in os.environ:
++            return _parse_token_index_filter(os.environ[env_name], source=env_name)
++    return False, ()
++
++
++def _dump_modes() -> frozenset[str]:
++    raw = (
++        os.environ.get("VLLM_DUMP_TENSORS_MODE")
++        or os.environ.get("TENSOR_TRACE_DUMP_TENSORS_MODE")
++        or "everything"
++    ).lower()
++    modes = {item for item in re.split(r"[,;+\s]+", raw) if item}
++    if not modes:
++        modes = {"everything"}
++    unknown = modes - _DUMP_MODE_CHOICES
++    if unknown:
++        raise ValueError(
++            "VLLM_DUMP_TENSORS_MODE supports only "
++            f"{sorted(_DUMP_MODE_CHOICES)}; got {sorted(unknown)}"
++        )
++    if len(modes) != 1:
++        raise ValueError("VLLM_DUMP_TENSORS_MODE must select exactly one mode")
++    return frozenset(modes)
++
++
++def _outlier_only_enabled() -> bool:
++    modes = _dump_modes()
++    return "outlier" in modes and not ({"everything", "qkv"} & modes)
++
++
++def dump_tensors_mode_enabled(mode: str) -> bool:
++    modes = _dump_modes()
++    if mode == "qkv":
++        return bool({"qkv", "everything"} & modes)
++    if mode == "everything":
++        return "everything" in modes
++    return mode in modes
++
++
++def clear_tensor_trace_tensors() -> None:
++    _TENSORS.clear()
++    _OUTLIER_STATS.clear()
++    _ROW_FILTER_WARNED.clear()
++
++
++def _warn_row_filter_once(stage: str, reason: str) -> None:
++    key = f"{stage}:{reason}"
++    if key in _ROW_FILTER_WARNED:
++        return
++    _ROW_FILTER_WARNED.add(key)
++    import warnings
++
++    warnings.warn(
++        f"Skipping tensor trace row filter for {stage}: {reason}",
++        RuntimeWarning,
++        stacklevel=3,
++    )
++
++
++def _select_tensor_trace_rows(
++    stage: str,
++    tensor: torch.Tensor,
++) -> torch.Tensor | None:
++    enabled, token_indices = _token_index_filter()
++    if not enabled:
++        return tensor
++    if not token_indices:
++        return None
++    if tensor.ndim == 0:
++        _warn_row_filter_once(stage, "scalar tensor has no token row dimension")
++        return None
++    valid_indices = [idx for idx in token_indices if idx < tensor.shape[0]]
++    if not valid_indices:
++        return None
++
++    indices = torch.tensor(valid_indices, dtype=torch.long, device=tensor.device)
++    return tensor.index_select(0, indices)
++
++
++def _round_significand_boundary(stage: str, tensor: torch.Tensor) -> torch.Tensor:
++    if "VLLM_SIGNIFICAND_BITS" not in os.environ:
++        return tensor
++    if not torch.is_tensor(tensor) or not torch.is_floating_point(tensor):
++        return tensor
++    from vllm.model_executor.models.significand_runtime import (
++        significand_round_boundary,
++    )
++
++    return significand_round_boundary(stage, tensor)
++
++
++def _significand_configured() -> bool:
++    return "VLLM_SIGNIFICAND_BITS" in os.environ
++
++
++def record_tensor_trace_tensor(stage: str, tensor: torch.Tensor) -> torch.Tensor:
++    if not tensor_trace_enabled() or _outlier_only_enabled() or not _stage_enabled(stage):
++        return tensor
++    if not torch.is_tensor(tensor):
++        return tensor
++    with torch.no_grad():
++        captured = tensor.detach()
++        captured = _select_tensor_trace_rows(stage, captured)
++        if captured is None:
++            return tensor
++        if torch.is_floating_point(captured):
++            captured = captured.to(torch.float32)
++        captured = captured.cpu().contiguous().clone()
++    _TENSORS.setdefault(stage, []).append(captured)
++    return tensor
++
++
++def _record_outlier_tensor(stage: str, tensor: torch.Tensor) -> None:
++    if not tensor_trace_enabled() or not _stage_enabled(stage):
++        return
++    if not torch.is_tensor(tensor) or not torch.is_floating_point(tensor):
++        return
++    with torch.no_grad():
++        captured = _select_tensor_trace_rows(stage, tensor.detach())
++        if captured is None:
++            return
++        captured = captured.to(torch.float32)
++        if captured.ndim == 0:
++            rows = captured.reshape(1, 1)
++        else:
++            rows = captured.reshape(-1, captured.shape[-1])
++        absmax = rows.abs().amax(dim=0).cpu()
++        square_sum = rows.square().sum(dim=0).cpu()
++        count = rows.shape[0]
++
++    stats = _OUTLIER_STATS.get(stage)
++    if stats is None:
++        _OUTLIER_STATS[stage] = {
++            "absmax": absmax,
++            "square_sum": square_sum,
++            "count": int(count),
++        }
++        return
++    stats["absmax"] = torch.maximum(stats["absmax"], absmax)  # type: ignore[arg-type]
++    stats["square_sum"] = stats["square_sum"] + square_sum  # type: ignore[operator]
++    stats["count"] = int(stats["count"]) + int(count)
++
++
++def record_dump_tensor(
++    mode: str,
++    stage: str,
++    tensor: torch.Tensor,
++) -> torch.Tensor:
++    if _significand_configured():
++        tensor = _round_significand_boundary(stage, tensor)
++    if not tensor_trace_enabled():
++        return tensor
++    modes = _dump_modes()
++    if "outlier" in modes and mode in {"everything", "qkv"}:
++        _record_outlier_tensor(stage, tensor)
++    if dump_tensors_mode_enabled(mode):
++        return record_tensor_trace_tensor(stage, tensor)
++    return tensor
++
++
++def _payload_and_metadata() -> tuple[dict[str, torch.Tensor], dict[str, object]]:
++    payload: dict[str, torch.Tensor] = {}
++    metadata: dict[str, object] = {}
++    for stage, chunks in _TENSORS.items():
++        stage_rows = []
++        for idx, tensor in enumerate(chunks):
++            key = f"{stage}__chunk_{idx:06d}" if len(chunks) > 1 else stage
++            payload[key] = tensor
++            stage_rows.append(
++                {
++                    "key": key,
++                    "shape": list(tensor.shape),
++                    "dtype": str(tensor.dtype),
++                }
++            )
++        metadata[stage] = stage_rows
++    return payload, metadata
++
++
++def _outlier_payload() -> dict[str, object]:
++    payload: dict[str, object] = {"schema_version": 1, "stats": {}}
++    stats_payload: dict[str, dict[str, torch.Tensor]] = {}
++    for stage, stats in _OUTLIER_STATS.items():
++        count = torch.tensor(int(stats["count"]), dtype=torch.long)
++        square_sum = stats["square_sum"]  # type: ignore[assignment]
++        mean_square = square_sum / torch.clamp(count.to(torch.float32), min=1.0)
++        absmax = stats["absmax"]  # type: ignore[assignment]
++        stats_payload[stage] = {
++            "absmax": absmax,
++            "square_sum": square_sum,
++            "mean_square": mean_square,
++            "count": count,
++            "absmax_indices": torch.argsort(absmax, descending=True),
++            "square_sum_indices": torch.argsort(square_sum, descending=True),
++            "mean_square_indices": torch.argsort(mean_square, descending=True),
++        }
++    payload["stats"] = stats_payload
++    return payload
++
++
++def _outlier_file_path(path: Path, has_raw_payload: bool) -> Path:
++    if has_raw_payload:
++        suffix = path.suffix + ".outlier.pt" if path.suffix else ".outlier.pt"
++        return path.with_suffix(suffix)
++    if path.suffix == ".pt":
++        return path
++    suffix = path.suffix + ".pt" if path.suffix else ".pt"
++    return path.with_suffix(suffix)
++
++
++def flush_tensor_trace_tensors(
++    tensor_file: str | os.PathLike[str] | None = None,
++) -> None:
++    target = str(tensor_file) if tensor_file is not None else _tensor_file()
++    if not target:
++        return
++    payload, metadata = _payload_and_metadata()
++    outlier_payload = _outlier_payload()
++    has_outliers = bool(outlier_payload["stats"])
++    if not payload and not has_outliers:
++        return
++    path = Path(target)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if payload:
++        save_file(payload, str(path))
++        path.with_suffix(path.suffix + ".meta.json").write_text(
++            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
++            encoding="utf-8",
++        )
++    if has_outliers:
++        outlier_path = _outlier_file_path(path, bool(payload))
++        torch.save(outlier_payload, outlier_path)
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index ca5d0e336..611d0ddb5 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -105,6 +105,7 @@ def kernel_unified_attention_2d(
+     num_seqs: tl.int32,
+     BLOCK_M: tl.constexpr,  # int
+     USE_FP8: tl.constexpr,  # bool
++    FP32_DOT_INPUT_PRECISION: tl.constexpr,  # str
+     FP8_MIN: tl.constexpr = float8_info.min,
+     FP8_MAX: tl.constexpr = float8_info.max,
+ ):
+@@ -265,7 +266,7 @@ def kernel_unified_attention_2d(
+             else:
+                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+         else:
+-            K = K_load
++            K = K_load.to(Q.dtype)
+ 
+         # V : (TILE_SIZE, HEAD_SIZE)
+         V_load = tl.load(
+@@ -280,7 +281,7 @@ def kernel_unified_attention_2d(
+             else:
+                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+         else:
+-            V = V_load
++            V = V_load.to(Q.dtype)
+ 
+         # Compute attention mask: causal by default (key <= query)
+         query_abs_pos = context_len + query_pos[:, None]
+@@ -318,7 +319,7 @@ def kernel_unified_attention_2d(
+         # S : (BLOCK_M, TILE_SIZE)
+         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+ 
+-        S += scale * tl.dot(Q, K)
++        S += scale * tl.dot(Q, K, input_precision=FP32_DOT_INPUT_PRECISION)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -382,7 +383,7 @@ def kernel_unified_attention_2d(
+             )
+ 
+         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+-        acc += tl.dot(P.to(V.dtype), V)
++        acc += tl.dot(P.to(V.dtype), V, input_precision=FP32_DOT_INPUT_PRECISION)
+ 
+     # epilogue
+     acc = acc / L[:, None]
+@@ -450,6 +451,7 @@ def kernel_unified_attention_3d(
+     num_seqs: tl.int32,
+     BLOCK_M: tl.constexpr,  # int
+     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
++    FP32_DOT_INPUT_PRECISION: tl.constexpr,  # str
+     USE_MM_PREFIX: tl.constexpr,  # bool
+     MAX_MM_RANGES: tl.constexpr,  # int
+     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
+@@ -620,7 +622,7 @@ def kernel_unified_attention_3d(
+             else:
+                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+         else:
+-            K = K_load
++            K = K_load.to(Q.dtype)
+ 
+         # V : (TILE_SIZE, HEAD_SIZE)
+         V_load = tl.load(
+@@ -635,7 +637,7 @@ def kernel_unified_attention_3d(
+             else:
+                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+         else:
+-            V = V_load
++            V = V_load.to(Q.dtype)
+ 
+         # Compute attention mask: causal by default (key <= query)
+         query_abs_pos = context_len + query_pos[:, None]
+@@ -672,7 +674,7 @@ def kernel_unified_attention_3d(
+ 
+         # S : (BLOCK_M, TILE_SIZE)
+         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+-        S += scale * tl.dot(Q, K)
++        S += scale * tl.dot(Q, K, input_precision=FP32_DOT_INPUT_PRECISION)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -736,7 +738,7 @@ def kernel_unified_attention_3d(
+             )
+ 
+         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+-        acc += tl.dot(P.to(V.dtype), V)
++        acc += tl.dot(P.to(V.dtype), V, input_precision=FP32_DOT_INPUT_PRECISION)
+ 
+     segm_output_offset = (
+         query_offset_0[:, None].to(tl.int64)
+@@ -970,6 +972,9 @@ def unified_attention(
+         q.element_size(),
+         is_prefill=False,
+     )
++    fp32_dot_input_precision = (
++        "ieee" if envs.VLLM_FLOAT32_MATMUL_PRECISION == "highest" else "tf32"
++    )
+ 
+     # Launch the 2D kernel if
+     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
+@@ -1040,6 +1045,7 @@ def unified_attention(
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             USE_FP8=output_scale is not None,
++            FP32_DOT_INPUT_PRECISION=fp32_dot_input_precision,
+         )
+     else:
+         kernel_unified_attention_3d[
+@@ -1092,6 +1098,7 @@ def unified_attention(
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
++            FP32_DOT_INPUT_PRECISION=fp32_dot_input_precision,
+         )
+         reduce_segments[(q.shape[0], num_query_heads)](
+             output_ptr=out,

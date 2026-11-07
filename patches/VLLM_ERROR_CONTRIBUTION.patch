@@ -1,0 +1,1541 @@
+diff --git a/vllm/model_executor/layers/layernorm.py b/vllm/model_executor/layers/layernorm.py
+index 7fa804587..509c5a0ab 100644
+--- a/vllm/model_executor/layers/layernorm.py
++++ b/vllm/model_executor/layers/layernorm.py
+@@ -18,6 +18,15 @@ from vllm.platforms import current_platform
+ logger = init_logger(__name__)
+ 
+ 
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ def _can_view_as_2d(x: torch.Tensor) -> bool:
+     """Return True if x.view(-1, x.shape[-1]) is viewable (no copy)."""
+     if x.dim() < 2:
+@@ -271,12 +280,15 @@ class RMSNorm(CustomOp):
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         """PyTorch-native implementation equivalent to forward()."""
+ 
++        weight = self.weight.data if self.has_weight else None
++        if _layercast_enabled() and weight is not None:
++            weight = weight.to(torch.float32)
+         return self.forward_static(
+             x,
+             self.variance_epsilon,
+             self.hidden_size,
+             x.dtype,
+-            self.weight.data if self.has_weight else None,
++            weight,
+             residual,
+             self.variance_size_override,
+         )
+@@ -288,6 +300,13 @@ class RMSNorm(CustomOp):
+     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+         if self.variance_size_override is not None:
+             return self.forward_native(x, residual)
++        if _layercast_enabled() and self.has_weight:
++            weight = self.weight.data.to(torch.float32)
++            if residual is not None:
++                return fused_add_rms_norm(
++                    x, residual, weight, self.variance_epsilon
++                )
++            return rms_norm(x, weight, self.variance_epsilon)
+ 
+         # Optional Oink SM100 fast path (no residual). This path is
+         # torch.compile-friendly via torch.ops.oink.rmsnorm and preserves
+diff --git a/vllm/model_executor/layers/linear.py b/vllm/model_executor/layers/linear.py
+index 44fd516f5..d8b662710 100644
+--- a/vllm/model_executor/layers/linear.py
++++ b/vllm/model_executor/layers/linear.py
+@@ -5,6 +5,7 @@ import itertools
+ from abc import abstractmethod
+ 
+ import torch
++import torch.nn.functional as F
+ from torch.nn.parameter import Parameter, UninitializedParameter
+ 
+ import vllm.envs as envs
+@@ -42,6 +43,15 @@ from vllm.platforms import current_platform
+ 
+ logger = init_logger(__name__)
+ 
++
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
+ WEIGHT_LOADER_V2_SUPPORTED = [
+     "UnquantizedLinearMethod",
+     "CompressedTensorsLinearMethod",
+@@ -223,6 +233,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if _layercast_enabled() and torch.is_floating_point(x):
++            weight = layer.weight
++            if torch.is_floating_point(weight):
++                bias = None if bias is None else bias.to(torch.float32)
++                return F.linear(x.to(torch.float32), weight.to(torch.float32), bias)
+         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
+             return linear_batch_invariant(x, layer.weight, bias)
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+diff --git a/vllm/model_executor/layers/rotary_embedding/__init__.py b/vllm/model_executor/layers/rotary_embedding/__init__.py
+index 28157daab..b4263c96a 100644
+--- a/vllm/model_executor/layers/rotary_embedding/__init__.py
++++ b/vllm/model_executor/layers/rotary_embedding/__init__.py
+@@ -26,6 +26,15 @@ from .yarn_scaling_rope import YaRNScalingRotaryEmbedding
+ _ROPE_DICT: dict[tuple[Any, ...], RotaryEmbedding] = {}
+ 
+ 
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ def get_rope(
+     head_size: int,
+     max_position: int,
+@@ -34,7 +43,9 @@ def get_rope(
+     dtype: torch.dtype | None = None,
+     dual_chunk_attention_config: dict[str, Any] | None = None,
+ ) -> RotaryEmbedding:
+-    if dtype is None:
++    if _layercast_enabled():
++        dtype = torch.float32
++    elif dtype is None:
+         dtype = torch.get_default_dtype()
+     if rope_parameters is not None:
+         # Transforms every value that is a list into a tuple for caching calls
+diff --git a/vllm/model_executor/layers/rotary_embedding/base.py b/vllm/model_executor/layers/rotary_embedding/base.py
+index 1374334b2..0e1c297b7 100644
+--- a/vllm/model_executor/layers/rotary_embedding/base.py
++++ b/vllm/model_executor/layers/rotary_embedding/base.py
+@@ -10,6 +10,15 @@ from vllm.model_executor.custom_op import CustomOp
+ from .common import ApplyRotaryEmb
+ 
+ 
++def _layercast_keep_fp32_rope_cache() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ # --8<-- [start:rotary_embedding]
+ @CustomOp.register("rotary_embedding")
+ class RotaryEmbeddingBase(CustomOp):
+@@ -101,6 +110,13 @@ class RotaryEmbeddingBase(CustomOp):
+         ):
+             return cos_sin_cache
+ 
++        if (
++            cos_sin_cache.dtype is torch.float32
++            and query.dtype is not torch.float32
++            and _layercast_keep_fp32_rope_cache()
++        ):
++            return cos_sin_cache.to(query.device, dtype=query.dtype)
++
+         cos_sin_cache = cos_sin_cache.to(query.device, dtype=query.dtype)
+         # Avoid mutating buffers during torch.compile (cudagraph) tracing.
+         if torch.compiler.is_compiling():
+diff --git a/vllm/model_executor/layers/vocab_parallel_embedding.py b/vllm/model_executor/layers/vocab_parallel_embedding.py
+index daaa86bed..f10b87b8c 100644
+--- a/vllm/model_executor/layers/vocab_parallel_embedding.py
++++ b/vllm/model_executor/layers/vocab_parallel_embedding.py
+@@ -28,6 +28,15 @@ from vllm.platforms import current_platform
+ DEFAULT_VOCAB_PADDING_SIZE = 64
+ 
+ 
++def _layercast_enabled() -> bool:
++    try:
++        from vllm.model_executor.models.layercast_runtime import layercast_enabled
++
++        return layercast_enabled()
++    except Exception:
++        return False
++
++
+ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+     """Unquantized method for embeddings."""
+ 
+@@ -66,9 +75,16 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
+         x: torch.Tensor,
+         bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        if _layercast_enabled() and torch.is_floating_point(x):
++            weight = layer.weight
++            if torch.is_floating_point(weight):
++                bias = None if bias is None else bias.to(torch.float32)
++                return F.linear(x.to(torch.float32), weight.to(torch.float32), bias)
+         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
+ 
+     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
++        if _layercast_enabled() and torch.is_floating_point(layer.weight):
++            return F.embedding(input_, layer.weight.to(torch.float32))
+         return F.embedding(input_, layer.weight)
+ 
+ 
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index d6c38664f..11d7bcecb 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
++import os
+ 
+ import torch
+ import torch.nn as nn
+@@ -22,6 +23,36 @@ from vllm.utils.torch_utils import set_default_torch_dtype
+ logger = init_logger(__name__)
+ 
+ 
++def _layercast_model_init_dtype(dtype: torch.dtype) -> torch.dtype:
++    enabled = os.environ.get("VLLM_LAYERCAST_FORCE_FP32", "").lower()
++    if enabled in {"1", "true", "yes", "on"} and dtype is torch.float32:
++        return torch.bfloat16
++    return dtype
++
++
++def _restore_layercast_buffer_dtype(model: nn.Module, dtype: torch.dtype) -> None:
++    enabled = os.environ.get("VLLM_LAYERCAST_FORCE_FP32", "").lower()
++    if enabled not in {"1", "true", "yes", "on"}:
++        return
++    for module in model.modules():
++        if isinstance(getattr(module, "dtype", None), torch.dtype):
++            module.dtype = dtype
++        buffer = getattr(module, "cos_sin_cache", None)
++        if (
++            isinstance(buffer, torch.Tensor)
++            and buffer.dtype != dtype
++            and hasattr(module, "_compute_cos_sin_cache")
++        ):
++            cache = module._compute_cos_sin_cache()
++            if not getattr(module, "use_flashinfer", False):
++                cache = cache.to(dtype=dtype)
++            cache = cache.to(device=buffer.device)
++            module._buffers["cos_sin_cache"] = cache
++        for name, buffer in module.named_buffers(recurse=False):
++            if buffer is not None and torch.is_floating_point(buffer):
++                module._buffers[name] = buffer.to(dtype=dtype)
++
++
+ class BaseModelLoader(ABC):
+     """Base class for model loaders."""
+ 
+@@ -50,13 +81,15 @@ class BaseModelLoader(ABC):
+             device_config.device if load_config.device is None else load_config.device
+         )
+         target_device = torch.device(load_device)
+-        with set_default_torch_dtype(model_config.dtype):
++        init_dtype = _layercast_model_init_dtype(model_config.dtype)
++        with set_default_torch_dtype(init_dtype):
+             with target_device:
+                 model = initialize_model(
+                     vllm_config=vllm_config,
+                     model_config=model_config,
+                     prefix=prefix,
+                 )
++            _restore_layercast_buffer_dtype(model, model_config.dtype)
+ 
+             log_model_inspection(model)
+ 
+diff --git a/vllm/model_executor/models/llama.py b/vllm/model_executor/models/llama.py
+index 2ecced3df..bebc77c15 100644
+--- a/vllm/model_executor/models/llama.py
++++ b/vllm/model_executor/models/llama.py
+@@ -76,6 +76,11 @@ from .utils import (
+     make_layers,
+     maybe_prefix,
+ )
++from .tensor_trace import record_tensor_trace_tensor as _trace_tensor
++from .error_contribution_trace import (
++    record_error_contribution_tensor as _trace_error_contribution,
++    record_mlp_block_oracle as _trace_mlp_block_oracle,
++)
+ 
+ 
+ class LlamaMLP(nn.Module):
+@@ -138,6 +143,7 @@ class LlamaAttention(nn.Module):
+     ) -> None:
+         super().__init__()
+         layer_idx = extract_layer_index(prefix)
++        self.layer_idx = layer_idx
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -228,7 +234,23 @@ class LlamaAttention(nn.Module):
+         qkv, _ = self.qkv_proj(hidden_states)
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+         q, k = self.rotary_emb(positions, q, k)
++        _trace_error_contribution(
++            f"attention.q.{self.layer_idx}",
++            q.view(-1, self.num_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.k_full.{self.layer_idx}",
++            k.view(-1, self.num_kv_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.v_full.{self.layer_idx}",
++            v.view(-1, self.num_kv_heads, self.head_dim),
++        )
+         attn_output = self.attn(q, k, v)
++        _trace_error_contribution(
++            f"attention.core_output.{self.layer_idx}",
++            attn_output.view(-1, self.num_heads, self.head_dim),
++        )
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
+@@ -312,6 +334,7 @@ class LlamaDecoderLayer(nn.Module):
+         self.post_attention_layernorm = RMSNorm(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
++        self.layer_idx = extract_layer_index(prefix)
+ 
+     def forward(
+         self,
+@@ -320,16 +343,31 @@ class LlamaDecoderLayer(nn.Module):
+         residual: torch.Tensor | None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         # Self Attention
++        layer = self.layer_idx
+         if residual is None:
+             residual = hidden_states
+             hidden_states = self.input_layernorm(hidden_states)
+         else:
+             hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.input_layernorm.output.residual", residual
++        )
+         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.post_attention_layernorm.output.residual", residual
++        )
++        _trace_error_contribution(f"block.mlp.input.{layer}", residual)
++        _trace_mlp_block_oracle(
++            f"oracle.block.mlp.output.{layer}",
++            self.post_attention_layernorm,
++            self.mlp,
++            residual,
++        )
+         hidden_states = self.mlp(hidden_states)
++        _trace_error_contribution(f"block.mlp.output.{layer}", hidden_states + residual)
+         return hidden_states, residual
+ 
+     def get_quant_config(self, vllm_config: VllmConfig) -> QuantizationConfig | None:
+@@ -432,7 +470,11 @@ class LlamaModel(nn.Module, EagleModelMixin):
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
+ 
++        _final_norm_input = hidden_states if residual is None else hidden_states + residual
++        _trace_error_contribution("forward.norm.input", _final_norm_input)
+         hidden_states, _ = self.norm(hidden_states, residual)
++        hidden_states = _trace_tensor("forward.norm.hidden", hidden_states)
++        _trace_error_contribution("forward.norm.hidden", hidden_states)
+ 
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+diff --git a/vllm/model_executor/models/qwen2.py b/vllm/model_executor/models/qwen2.py
+index 27aa6175b..0d164907f 100644
+--- a/vllm/model_executor/models/qwen2.py
++++ b/vllm/model_executor/models/qwen2.py
+@@ -78,6 +78,11 @@ from .utils import (
+     make_layers,
+     maybe_prefix,
+ )
++from .tensor_trace import record_tensor_trace_tensor as _trace_tensor
++from .error_contribution_trace import (
++    record_error_contribution_tensor as _trace_error_contribution,
++    record_mlp_block_oracle as _trace_mlp_block_oracle,
++)
+ 
+ 
+ class Qwen2MLP(nn.Module):
+@@ -134,6 +139,7 @@ class Qwen2Attention(nn.Module):
+         rms_norm_eps: float = 1e-6,
+     ) -> None:
+         super().__init__()
++        self.layer_idx = extract_layer_index(prefix)
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -231,7 +237,23 @@ class Qwen2Attention(nn.Module):
+             k = k.view(total_tokens, self.kv_size)
+ 
+         q, k = self.rotary_emb(positions, q, k)
++        _trace_error_contribution(
++            f"attention.q.{self.layer_idx}",
++            q.view(-1, self.num_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.k_full.{self.layer_idx}",
++            k.view(-1, self.num_kv_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.v_full.{self.layer_idx}",
++            v.view(-1, self.num_kv_heads, self.head_dim),
++        )
+         attn_output = self.attn(q, k, v)
++        _trace_error_contribution(
++            f"attention.core_output.{self.layer_idx}",
++            attn_output.view(-1, self.num_heads, self.head_dim),
++        )
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
+@@ -288,6 +310,7 @@ class Qwen2DecoderLayer(nn.Module):
+         self.post_attention_layernorm = RMSNorm(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
++        self.layer_idx = extract_layer_index(prefix)
+ 
+     def forward(
+         self,
+@@ -296,11 +319,15 @@ class Qwen2DecoderLayer(nn.Module):
+         residual: torch.Tensor | None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         # Self Attention
++        layer = self.layer_idx
+         if residual is None:
+             residual = hidden_states
+             hidden_states = self.input_layernorm(hidden_states)
+         else:
+             hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.input_layernorm.output.residual", residual
++        )
+         hidden_states = self.self_attn(
+             positions=positions,
+             hidden_states=hidden_states,
+@@ -308,7 +335,18 @@ class Qwen2DecoderLayer(nn.Module):
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.post_attention_layernorm.output.residual", residual
++        )
++        _trace_error_contribution(f"block.mlp.input.{layer}", residual)
++        _trace_mlp_block_oracle(
++            f"oracle.block.mlp.output.{layer}",
++            self.post_attention_layernorm,
++            self.mlp,
++            residual,
++        )
+         hidden_states = self.mlp(hidden_states)
++        _trace_error_contribution(f"block.mlp.output.{layer}", hidden_states + residual)
+         return hidden_states, residual
+ 
+ 
+@@ -451,7 +489,11 @@ class Qwen2Model(nn.Module, EagleModelMixin):
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
+ 
++        _final_norm_input = hidden_states if residual is None else hidden_states + residual
++        _trace_error_contribution("forward.norm.input", _final_norm_input)
+         hidden_states, _ = self.norm(hidden_states, residual)
++        hidden_states = _trace_tensor("forward.norm.hidden", hidden_states)
++        _trace_error_contribution("forward.norm.hidden", hidden_states)
+ 
+         if len(aux_hidden_states) > 0:
+             return hidden_states, aux_hidden_states
+diff --git a/vllm/model_executor/models/qwen3.py b/vllm/model_executor/models/qwen3.py
+index 91931f9f4..ec7a7870b 100644
+--- a/vllm/model_executor/models/qwen3.py
++++ b/vllm/model_executor/models/qwen3.py
+@@ -49,6 +49,10 @@ from vllm.transformers_utils.config import set_default_rope_theta
+ from vllm.v1.attention.backend import AttentionType
+ 
+ from .interfaces import SupportsEagle, SupportsEagle3, SupportsLoRA, SupportsPP
++from .error_contribution_trace import (
++    record_error_contribution_tensor as _trace_error_contribution,
++    record_mlp_block_oracle as _trace_mlp_block_oracle,
++)
+ from .qwen2 import Qwen2MLP as Qwen3MLP
+ from .qwen2 import Qwen2Model
+ from .utils import AutoWeightsLoader, PPMissingLayer, extract_layer_index, maybe_prefix
+@@ -74,6 +78,7 @@ class Qwen3Attention(nn.Module):
+         dual_chunk_attention_config: dict[str, Any] | None = None,
+     ) -> None:
+         super().__init__()
++        self.layer_idx = extract_layer_index(prefix)
+         self.hidden_size = hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+         self.total_num_heads = num_heads
+@@ -157,7 +162,23 @@ class Qwen3Attention(nn.Module):
+         k_by_head = self.k_norm(k_by_head)
+         k = k_by_head.view(k.shape)
+         q, k = self.rotary_emb(positions, q, k)
++        _trace_error_contribution(
++            f"attention.q.{self.layer_idx}",
++            q.view(-1, self.num_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.k_full.{self.layer_idx}",
++            k.view(-1, self.num_kv_heads, self.head_dim),
++        )
++        _trace_error_contribution(
++            f"attention.v_full.{self.layer_idx}",
++            v.view(-1, self.num_kv_heads, self.head_dim),
++        )
+         attn_output = self.attn(q, k, v)
++        _trace_error_contribution(
++            f"attention.core_output.{self.layer_idx}",
++            attn_output.view(-1, self.num_heads, self.head_dim),
++        )
+         output, _ = self.o_proj(attn_output)
+         return output
+ 
+@@ -212,6 +233,7 @@ class Qwen3DecoderLayer(nn.Module):
+         self.post_attention_layernorm = RMSNorm(
+             config.hidden_size, eps=config.rms_norm_eps
+         )
++        self.layer_idx = extract_layer_index(prefix)
+ 
+     def forward(
+         self,
+@@ -220,11 +242,15 @@ class Qwen3DecoderLayer(nn.Module):
+         residual: torch.Tensor | None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         # Self Attention
++        layer = self.layer_idx
+         if residual is None:
+             residual = hidden_states
+             hidden_states = self.input_layernorm(hidden_states)
+         else:
+             hidden_states, residual = self.input_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.input_layernorm.output.residual", residual
++        )
+         hidden_states = self.self_attn(
+             positions=positions,
+             hidden_states=hidden_states,
+@@ -232,7 +258,18 @@ class Qwen3DecoderLayer(nn.Module):
+ 
+         # Fully Connected
+         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
++        _trace_error_contribution(
++            f"layer_{layer}.post_attention_layernorm.output.residual", residual
++        )
++        _trace_error_contribution(f"block.mlp.input.{layer}", residual)
++        _trace_mlp_block_oracle(
++            f"oracle.block.mlp.output.{layer}",
++            self.post_attention_layernorm,
++            self.mlp,
++            residual,
++        )
+         hidden_states = self.mlp(hidden_states)
++        _trace_error_contribution(f"block.mlp.output.{layer}", hidden_states + residual)
+         return hidden_states, residual
+ 
+ 
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index ca5d0e336..611d0ddb5 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -105,6 +105,7 @@ def kernel_unified_attention_2d(
+     num_seqs: tl.int32,
+     BLOCK_M: tl.constexpr,  # int
+     USE_FP8: tl.constexpr,  # bool
++    FP32_DOT_INPUT_PRECISION: tl.constexpr,  # str
+     FP8_MIN: tl.constexpr = float8_info.min,
+     FP8_MAX: tl.constexpr = float8_info.max,
+ ):
+@@ -265,7 +266,7 @@ def kernel_unified_attention_2d(
+             else:
+                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+         else:
+-            K = K_load
++            K = K_load.to(Q.dtype)
+ 
+         # V : (TILE_SIZE, HEAD_SIZE)
+         V_load = tl.load(
+@@ -280,7 +281,7 @@ def kernel_unified_attention_2d(
+             else:
+                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+         else:
+-            V = V_load
++            V = V_load.to(Q.dtype)
+ 
+         # Compute attention mask: causal by default (key <= query)
+         query_abs_pos = context_len + query_pos[:, None]
+@@ -318,7 +319,7 @@ def kernel_unified_attention_2d(
+         # S : (BLOCK_M, TILE_SIZE)
+         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+ 
+-        S += scale * tl.dot(Q, K)
++        S += scale * tl.dot(Q, K, input_precision=FP32_DOT_INPUT_PRECISION)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -382,7 +383,7 @@ def kernel_unified_attention_2d(
+             )
+ 
+         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+-        acc += tl.dot(P.to(V.dtype), V)
++        acc += tl.dot(P.to(V.dtype), V, input_precision=FP32_DOT_INPUT_PRECISION)
+ 
+     # epilogue
+     acc = acc / L[:, None]
+@@ -450,6 +451,7 @@ def kernel_unified_attention_3d(
+     num_seqs: tl.int32,
+     BLOCK_M: tl.constexpr,  # int
+     NUM_SEGMENTS_PER_SEQ: tl.constexpr,  # int
++    FP32_DOT_INPUT_PRECISION: tl.constexpr,  # str
+     USE_MM_PREFIX: tl.constexpr,  # bool
+     MAX_MM_RANGES: tl.constexpr,  # int
+     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
+@@ -620,7 +622,7 @@ def kernel_unified_attention_3d(
+             else:
+                 K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
+         else:
+-            K = K_load
++            K = K_load.to(Q.dtype)
+ 
+         # V : (TILE_SIZE, HEAD_SIZE)
+         V_load = tl.load(
+@@ -635,7 +637,7 @@ def kernel_unified_attention_3d(
+             else:
+                 V = (V_load.to(tl.float32) * tl.load(v_scale)).to(Q.dtype)
+         else:
+-            V = V_load
++            V = V_load.to(Q.dtype)
+ 
+         # Compute attention mask: causal by default (key <= query)
+         query_abs_pos = context_len + query_pos[:, None]
+@@ -672,7 +674,7 @@ def kernel_unified_attention_3d(
+ 
+         # S : (BLOCK_M, TILE_SIZE)
+         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+-        S += scale * tl.dot(Q, K)
++        S += scale * tl.dot(Q, K, input_precision=FP32_DOT_INPUT_PRECISION)
+ 
+         if USE_SOFTCAP:
+             S = apply_softcap(S, softcap)
+@@ -736,7 +738,7 @@ def kernel_unified_attention_3d(
+             )
+ 
+         # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+-        acc += tl.dot(P.to(V.dtype), V)
++        acc += tl.dot(P.to(V.dtype), V, input_precision=FP32_DOT_INPUT_PRECISION)
+ 
+     segm_output_offset = (
+         query_offset_0[:, None].to(tl.int64)
+@@ -970,6 +972,9 @@ def unified_attention(
+         q.element_size(),
+         is_prefill=False,
+     )
++    fp32_dot_input_precision = (
++        "ieee" if envs.VLLM_FLOAT32_MATMUL_PRECISION == "highest" else "tf32"
++    )
+ 
+     # Launch the 2D kernel if
+     # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
+@@ -1040,6 +1045,7 @@ def unified_attention(
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             USE_FP8=output_scale is not None,
++            FP32_DOT_INPUT_PRECISION=fp32_dot_input_precision,
+         )
+     else:
+         kernel_unified_attention_3d[
+@@ -1092,6 +1098,7 @@ def unified_attention(
+             num_seqs=num_seqs,
+             BLOCK_M=BLOCK_M,
+             NUM_SEGMENTS_PER_SEQ=num_par_softmax_segments,
++            FP32_DOT_INPUT_PRECISION=fp32_dot_input_precision,
+         )
+         reduce_segments[(q.shape[0], num_query_heads)](
+             output_ptr=out,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 2e62206da..7eed3892b 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -3488,6 +3488,71 @@ class GPUModelRunner(
+         finally:
+             self.prepare_inputs_event.record()
+ 
++    def _set_tensor_trace_row_metadata(
++        self,
++        *,
++        num_reqs: int,
++        num_tokens_unpadded: int,
++        num_tokens_padded: int,
++        num_scheduled_tokens_np: np.ndarray,
++    ) -> None:
++        try:
++            from vllm.model_executor.models.tensor_trace import (
++                clear_tensor_trace_row_metadata,
++                set_tensor_trace_row_metadata,
++                tensor_trace_enabled,
++            )
++        except (ImportError, AttributeError):
++            return
++
++        if not tensor_trace_enabled():
++            return
++        if num_tokens_unpadded <= 0:
++            clear_tensor_trace_row_metadata()
++            return
++
++        req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens_np)
++        token_offsets = self.query_pos.np[:num_tokens_unpadded]
++        token_positions = (
++            self.input_batch.num_computed_tokens_cpu[req_indices] + token_offsets
++        )
++
++        row_request_indices = req_indices.astype(np.int32, copy=False).tolist()
++        row_token_positions = token_positions.astype(np.int64, copy=False).tolist()
++        row_token_ids = [
++            int(token_id)
++            for token_id in self.input_ids.cpu[:num_tokens_unpadded].tolist()
++        ]
++
++        if num_tokens_padded > num_tokens_unpadded:
++            padding = num_tokens_padded - num_tokens_unpadded
++            row_request_indices.extend([-1] * padding)
++            row_token_positions.extend([-1] * padding)
++            row_token_ids.extend([-1] * padding)
++
++        set_tensor_trace_row_metadata(
++            {
++                "request_ids": [
++                    str(req_id) for req_id in self.input_batch.req_ids[:num_reqs]
++                ],
++                "row_request_indices": row_request_indices,
++                "row_token_positions": row_token_positions,
++                "row_token_ids": row_token_ids,
++                "unpadded_rows": int(num_tokens_unpadded),
++                "padded_rows": int(num_tokens_padded),
++            }
++        )
++
++    @staticmethod
++    def _clear_tensor_trace_row_metadata() -> None:
++        try:
++            from vllm.model_executor.models.tensor_trace import (
++                clear_tensor_trace_row_metadata,
++            )
++        except (ImportError, AttributeError):
++            return
++        clear_tensor_trace_row_metadata()
++
+     def _model_forward(
+         self,
+         input_ids: torch.Tensor | None = None,
+@@ -4013,31 +4078,40 @@ class GPUModelRunner(
+         # When spec decode is enabled, defer connector finalization
+         # (wait_for_save + clear metadata) until after draft model runs.
+         defer_kv_connector_finalize = self.speculative_config is not None
+-        with (
+-            set_forward_context(
+-                attn_metadata,
+-                self.vllm_config,
+-                num_tokens=num_tokens_padded,
+-                num_tokens_across_dp=num_tokens_across_dp,
+-                cudagraph_runtime_mode=cudagraph_mode,
+-                batch_descriptor=batch_desc,
+-                ubatch_slices=ubatch_slices_padded,
+-                slot_mapping=slot_mappings,
+-                skip_compiled=has_encoder_input,
+-            ),
+-            record_function_or_nullcontext("gpu_model_runner: forward"),
+-            self.maybe_get_kv_connector_output(
+-                scheduler_output,
+-                defer_finalize=defer_kv_connector_finalize,
+-            ) as kv_connector_output,
+-        ):
+-            model_output = self._model_forward(
+-                input_ids=input_ids,
+-                positions=positions,
+-                intermediate_tensors=intermediate_tensors,
+-                inputs_embeds=inputs_embeds,
+-                **model_kwargs,
+-            )
++        self._set_tensor_trace_row_metadata(
++            num_reqs=num_reqs,
++            num_tokens_unpadded=num_tokens_unpadded,
++            num_tokens_padded=num_tokens_padded,
++            num_scheduled_tokens_np=num_scheduled_tokens_np,
++        )
++        try:
++            with (
++                set_forward_context(
++                    attn_metadata,
++                    self.vllm_config,
++                    num_tokens=num_tokens_padded,
++                    num_tokens_across_dp=num_tokens_across_dp,
++                    cudagraph_runtime_mode=cudagraph_mode,
++                    batch_descriptor=batch_desc,
++                    ubatch_slices=ubatch_slices_padded,
++                    slot_mapping=slot_mappings,
++                    skip_compiled=has_encoder_input,
++                ),
++                record_function_or_nullcontext("gpu_model_runner: forward"),
++                self.maybe_get_kv_connector_output(
++                    scheduler_output,
++                    defer_finalize=defer_kv_connector_finalize,
++                ) as kv_connector_output,
++            ):
++                model_output = self._model_forward(
++                    input_ids=input_ids,
++                    positions=positions,
++                    intermediate_tensors=intermediate_tensors,
++                    inputs_embeds=inputs_embeds,
++                    **model_kwargs,
++                )
++        finally:
++            self._clear_tensor_trace_row_metadata()
+ 
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+diff --git a/vllm/model_executor/models/error_contribution_trace.py b/vllm/model_executor/models/error_contribution_trace.py
+new file mode 100644
+index 000000000..925cff2cf
+--- /dev/null
++++ b/vllm/model_executor/models/error_contribution_trace.py
+@@ -0,0 +1,530 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Env-gated tensor hooks for local error-contribution experiments."""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++from contextlib import contextmanager
++from collections.abc import Iterable
++from pathlib import Path
++
++import torch
++import torch.nn.functional as F
++from safetensors.torch import safe_open, save_file
++
++_REFERENCE_MODE = "reference"
++_CANDIDATE_MODE = "candidate"
++_MODES = {_REFERENCE_MODE, _CANDIDATE_MODE}
++
++_TENSORS: dict[str, list[torch.Tensor]] = {}
++_MSE_TENSORS: dict[str, list[torch.Tensor]] = {}
++_PAIR_TENSORS: dict[str, list[torch.Tensor]] = {}
++_CANDIDATE_TENSORS: dict[str, list[torch.Tensor]] = {}
++_INPUT_DIFFS: dict[tuple[int, int], torch.Tensor] = {}
++_POST_DIFFS: dict[tuple[int, int], torch.Tensor] = {}
++_FINAL_NORM_INPUT_DIFFS: dict[int, torch.Tensor] = {}
++_TOKEN_FILTER_OVERRIDE: tuple[bool, tuple[int, ...], int | None] | None = None
++_WARNED: set[str] = set()
++_INPUT_STAGE_RE = re.compile(r"^layer_(\d+)\.input_layernorm\.output\.residual$")
++_POST_STAGE_RE = re.compile(r"^layer_(\d+)\.post_attention_layernorm\.output\.residual$")
++_FULL_ROW_STAGE_RE = re.compile(r"^attention\.(?:k_full|v_full)\.\d+$")
++_RAW_CANDIDATE_STAGE_RE = re.compile(
++    r"^(?:attention\.(?:q|k_full|v_full|core_output)\.\d+|"
++    r"block\.mlp\.(?:input|output)\.\d+|"
++    r"oracle\.block\.mlp\.output\.\d+)$"
++)
++_ORACLE_STAGE_RE = re.compile(r"^oracle\.")
++
++
++def _output_file() -> str:
++    return os.environ.get("VLLM_ERROR_CONTRIBUTION_OUTPUT_FILE", "")
++
++
++def _reference_file() -> str:
++    return os.environ.get("VLLM_ERROR_CONTRIBUTION_REFERENCE_FILE", "")
++
++
++def _mode() -> str:
++    value = os.environ.get("VLLM_ERROR_CONTRIBUTION_MODE", "").strip().lower()
++    if not value:
++        return ""
++    if value not in _MODES:
++        raise ValueError(
++            "VLLM_ERROR_CONTRIBUTION_MODE must be one of "
++            f"{sorted(_MODES)}; got {value!r}"
++        )
++    return value
++
++
++def error_contribution_enabled() -> bool:
++    return bool(_output_file() and _mode())
++
++
++def _stage_enabled(stage: str) -> bool:
++    pattern = os.environ.get("VLLM_ERROR_CONTRIBUTION_STAGE_REGEX", "")
++    if not pattern:
++        return True
++    return re.search(pattern, stage) is not None
++
++
++def _parse_token_indices(
++    value: str | Iterable[int],
++    *,
++    source: str,
++) -> tuple[int, ...]:
++    raw_items = re.split(r"[,;+\s]+", value.strip()) if isinstance(value, str) else value
++    token_indices: list[int] = []
++    seen: set[int] = set()
++    for item in raw_items:
++        if item == "":
++            continue
++        try:
++            index = int(item)
++        except (TypeError, ValueError) as exc:
++            raise ValueError(f"{source} must contain integer row indices") from exc
++        if index < 0:
++            raise ValueError(f"{source} does not support negative indices")
++        if index in seen:
++            continue
++        seen.add(index)
++        token_indices.append(index)
++    return tuple(token_indices)
++
++
++def _expected_rows_from_env() -> int | None:
++    value = os.environ.get("VLLM_ERROR_CONTRIBUTION_EXPECTED_ROWS", "").strip()
++    if not value:
++        return None
++    expected = int(value)
++    if expected <= 0:
++        raise ValueError("VLLM_ERROR_CONTRIBUTION_EXPECTED_ROWS must be positive")
++    return expected
++
++
++def set_error_contribution_token_filter(
++    token_indices: str | Iterable[int] | None,
++    *,
++    expected_rows: int | None = None,
++) -> None:
++    """Set selected row indices for the next traced prefill batch."""
++
++    global _TOKEN_FILTER_OVERRIDE
++    if token_indices is None:
++        _TOKEN_FILTER_OVERRIDE = (False, (), expected_rows)
++        return
++    _TOKEN_FILTER_OVERRIDE = (
++        True,
++        _parse_token_indices(token_indices, source="set_error_contribution_token_filter"),
++        expected_rows,
++    )
++
++
++def clear_error_contribution_token_filter_override() -> None:
++    global _TOKEN_FILTER_OVERRIDE
++    _TOKEN_FILTER_OVERRIDE = None
++
++
++def _token_filter() -> tuple[bool, tuple[int, ...], int | None]:
++    if _TOKEN_FILTER_OVERRIDE is not None:
++        return _TOKEN_FILTER_OVERRIDE
++    if "VLLM_ERROR_CONTRIBUTION_TOKEN_INDICES" in os.environ:
++        return (
++            True,
++            _parse_token_indices(
++                os.environ["VLLM_ERROR_CONTRIBUTION_TOKEN_INDICES"],
++                source="VLLM_ERROR_CONTRIBUTION_TOKEN_INDICES",
++            ),
++            _expected_rows_from_env(),
++        )
++    return False, (), _expected_rows_from_env()
++
++
++def clear_error_contribution_trace() -> None:
++    _TENSORS.clear()
++    _MSE_TENSORS.clear()
++    _PAIR_TENSORS.clear()
++    _CANDIDATE_TENSORS.clear()
++    _INPUT_DIFFS.clear()
++    _POST_DIFFS.clear()
++    _FINAL_NORM_INPUT_DIFFS.clear()
++    _WARNED.clear()
++
++
++def _warn_once(stage: str, reason: str) -> None:
++    key = f"{stage}:{reason}"
++    if key in _WARNED:
++        return
++    _WARNED.add(key)
++    import warnings
++
++    warnings.warn(
++        f"Skipping error-contribution trace for {stage}: {reason}",
++        RuntimeWarning,
++        stacklevel=3,
++    )
++
++
++def _select_rows(stage: str, tensor: torch.Tensor) -> torch.Tensor | None:
++    enabled, token_indices, expected_rows = _token_filter()
++    if expected_rows is not None and (
++        tensor.ndim == 0 or int(tensor.shape[0]) != int(expected_rows)
++    ):
++        return None
++    if _FULL_ROW_STAGE_RE.fullmatch(stage):
++        return tensor
++    if not enabled:
++        return tensor
++    if not token_indices:
++        return None
++    if tensor.ndim == 0:
++        _warn_once(stage, "scalar tensor has no token row dimension")
++        return None
++    valid_indices = [idx for idx in token_indices if idx < tensor.shape[0]]
++    if not valid_indices:
++        return None
++    indices = torch.tensor(valid_indices, dtype=torch.long, device=tensor.device)
++    return tensor.index_select(0, indices)
++
++
++def _to_cpu_float(tensor: torch.Tensor) -> torch.Tensor:
++    if torch.is_floating_point(tensor):
++        tensor = tensor.to(torch.float32)
++    return tensor.detach().cpu().contiguous().clone()
++
++
++def _next_key(stage: str, count: int) -> str:
++    if count == 0:
++        return stage
++    return f"{stage}__chunk_{count:06d}"
++
++
++def _reference_tensor(stage: str, count: int) -> torch.Tensor:
++    path = _reference_file()
++    if not path:
++        raise RuntimeError("candidate mode requires VLLM_ERROR_CONTRIBUTION_REFERENCE_FILE")
++    key = _next_key(stage, count)
++    fallback_key = f"{stage}__chunk_{count:06d}"
++    with safe_open(path, framework="pt", device="cpu") as handle:
++        keys = set(handle.keys())
++        selected_key = key if key in keys else fallback_key
++        if selected_key not in keys:
++            raise KeyError(
++                f"reference tensor {key!r}/{fallback_key!r} not found in {path}"
++            )
++        return handle.get_tensor(selected_key).to(torch.float32)
++
++
++def _record_reference(stage: str, selected: torch.Tensor) -> None:
++    _TENSORS.setdefault(stage, []).append(_to_cpu_float(selected))
++
++
++def _record_candidate_raw(stage: str, selected: torch.Tensor) -> None:
++    _CANDIDATE_TENSORS.setdefault(stage, []).append(_to_cpu_float(selected))
++
++
++@contextmanager
++def _strict_fp32_matmul():
++    old_precision = torch.get_float32_matmul_precision()
++    old_cuda_tf32 = torch.backends.cuda.matmul.allow_tf32
++    old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
++    try:
++        torch.set_float32_matmul_precision("highest")
++        torch.backends.cuda.matmul.allow_tf32 = False
++        torch.backends.cudnn.allow_tf32 = False
++        yield
++    finally:
++        torch.set_float32_matmul_precision(old_precision)
++        torch.backends.cuda.matmul.allow_tf32 = old_cuda_tf32
++        torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
++
++
++def _linear_fp32(layer: object, x: torch.Tensor) -> torch.Tensor:
++    weight = getattr(layer, "weight", None)
++    if weight is None:
++        raise AttributeError(f"{type(layer).__name__} has no weight tensor")
++    bias = getattr(layer, "bias", None)
++    weight_tensor = weight.detach().to(device=x.device, dtype=torch.float32)
++    bias_tensor = None
++    if bias is not None:
++        bias_tensor = bias.detach().to(device=x.device, dtype=torch.float32)
++    return F.linear(x.to(torch.float32), weight_tensor, bias_tensor)
++
++
++def _rmsnorm_fp32(layer: object, x: torch.Tensor) -> torch.Tensor:
++    x_fp32 = x.to(torch.float32)
++    weight = getattr(layer, "weight", None)
++    variance_size_override = getattr(layer, "variance_size_override", None)
++    x_var = x_fp32 if variance_size_override is None else x_fp32[..., :variance_size_override]
++    variance = x_var.pow(2).mean(dim=-1, keepdim=True)
++    eps = float(getattr(layer, "variance_epsilon", getattr(layer, "eps", 1e-6)))
++    output = x_fp32 * torch.rsqrt(variance + eps)
++    if weight is None:
++        return output
++    return output * weight.detach().to(device=x.device, dtype=torch.float32)
++
++
++def record_mlp_block_oracle(name: str, post_attention_layernorm: object,
++                            mlp_module: object,
++                            residual_stream: torch.Tensor) -> None:
++    if not error_contribution_enabled() or _mode() != _CANDIDATE_MODE:
++        return
++    if not _stage_enabled(name):
++        return
++    with torch.no_grad(), _strict_fp32_matmul():
++        x = residual_stream.to(torch.float32)
++        normed = _rmsnorm_fp32(post_attention_layernorm, x)
++        gate_up = _linear_fp32(mlp_module.gate_up_proj, normed)
++        gate, up = gate_up.chunk(2, dim=-1)
++        hidden = F.silu(gate) * up
++        mlp_out = _linear_fp32(mlp_module.down_proj, hidden)
++        record_error_contribution_tensor(name, x + mlp_out)
++
++
++def _row_mean(tensor: torch.Tensor) -> torch.Tensor:
++    if tensor.ndim == 0:
++        return tensor.reshape(1)
++    return tensor.reshape(tensor.shape[0], -1).mean(dim=1)
++
++
++def _pair_statistics(before: torch.Tensor, after: torch.Tensor) -> dict[str, torch.Tensor]:
++    if tuple(before.shape) != tuple(after.shape):
++        raise RuntimeError(
++            f"shape mismatch for paired residual tensors: before {tuple(before.shape)} "
++            f"vs after {tuple(after.shape)}"
++        )
++    delta = after - before
++    before_mse = _row_mean(before.square())
++    mean_product = _row_mean(after * before)
++    cross = mean_product - before_mse
++    stats = {
++        "delta_mse": _row_mean(delta.square()),
++        "before_mse": before_mse,
++        "mean_product": mean_product,
++        "cross": cross,
++        "covariance": cross,
++    }
++    if before.ndim == 0:
++        stats["before_delta_rho"] = torch.zeros(1, dtype=torch.float32)
++    else:
++        before_flat = before.reshape(before.shape[0], -1)
++        delta_flat = delta.reshape(delta.shape[0], -1)
++        denom = before_flat.norm(dim=1) * delta_flat.norm(dim=1)
++        rho = torch.zeros_like(denom)
++        valid = denom > 0
++        rho[valid] = (before_flat[valid] * delta_flat[valid]).sum(dim=1) / denom[valid]
++        stats["before_delta_rho"] = rho
++    if before.ndim == 0:
++        stats["centered_covariance"] = torch.zeros(1, dtype=torch.float32)
++    else:
++        before_flat = before.reshape(before.shape[0], -1)
++        after_flat = after.reshape(after.shape[0], -1)
++        before_centered = before_flat - before_flat.mean(dim=1, keepdim=True)
++        after_centered = after_flat - after_flat.mean(dim=1, keepdim=True)
++        stats["centered_covariance"] = (before_centered * after_centered).mean(dim=1)
++    return {key: value.to(torch.float32).contiguous() for key, value in stats.items()}
++
++
++def _append_pair_stat(kind: str, layer: int | None, metric: str, values: torch.Tensor) -> None:
++    key = f"{kind}.{metric}" if layer is None else f"{kind}.{metric}.{layer}"
++    _PAIR_TENSORS.setdefault(key, []).append(values)
++
++
++def _record_residual_pair(
++    *,
++    kind: str,
++    layer: int | None,
++    before: torch.Tensor,
++    after: torch.Tensor,
++) -> None:
++    for metric, values in _pair_statistics(before, after).items():
++        _append_pair_stat(kind, layer, metric, values)
++
++
++def _record_candidate_pairs(stage: str, chunk_index: int, diff: torch.Tensor) -> None:
++    input_match = _INPUT_STAGE_RE.fullmatch(stage)
++    if input_match is not None:
++        layer = int(input_match.group(1))
++        _INPUT_DIFFS[(layer, chunk_index)] = diff
++        previous_post = _POST_DIFFS.pop((layer - 1, chunk_index), None)
++        if previous_post is not None:
++            _record_residual_pair(
++                kind="mlp",
++                layer=layer - 1,
++                before=previous_post,
++                after=diff,
++            )
++        return
++
++    post_match = _POST_STAGE_RE.fullmatch(stage)
++    if post_match is not None:
++        layer = int(post_match.group(1))
++        input_diff = _INPUT_DIFFS.pop((layer, chunk_index), None)
++        if input_diff is not None:
++            _record_residual_pair(
++                kind="attention",
++                layer=layer,
++                before=input_diff,
++                after=diff,
++            )
++        _POST_DIFFS[(layer, chunk_index)] = diff
++        return
++
++    if stage == "forward.norm.input":
++        _FINAL_NORM_INPUT_DIFFS[chunk_index] = diff
++        pending_posts = [
++            (layer, post_diff)
++            for (layer, stored_chunk), post_diff in _POST_DIFFS.items()
++            if stored_chunk == chunk_index
++        ]
++        if pending_posts:
++            layer, post_diff = max(pending_posts, key=lambda item: item[0])
++            _POST_DIFFS.pop((layer, chunk_index), None)
++            _record_residual_pair(
++                kind="mlp",
++                layer=layer,
++                before=post_diff,
++                after=diff,
++            )
++        return
++
++    if stage == "forward.norm.hidden":
++        norm_input = _FINAL_NORM_INPUT_DIFFS.pop(chunk_index, None)
++        if norm_input is not None:
++            _record_residual_pair(
++                kind="final_norm",
++                layer=None,
++                before=norm_input,
++                after=diff,
++            )
++
++
++def _record_candidate(stage: str, selected: torch.Tensor) -> None:
++    if _RAW_CANDIDATE_STAGE_RE.fullmatch(stage):
++        _record_candidate_raw(stage, selected)
++    if _ORACLE_STAGE_RE.match(stage):
++        return
++
++    chunks = _MSE_TENSORS.setdefault(stage, [])
++    chunk_index = len(chunks)
++    reference = _reference_tensor(stage, chunk_index)
++    candidate = selected.detach().to(torch.float32).cpu()
++    if tuple(candidate.shape) != tuple(reference.shape):
++        raise RuntimeError(
++            f"shape mismatch for {stage}: candidate {tuple(candidate.shape)} "
++            f"vs reference {tuple(reference.shape)}"
++        )
++    diff = candidate - reference
++    if diff.ndim == 0:
++        mse = diff.square().reshape(1)
++    else:
++        mse = diff.square().reshape(diff.shape[0], -1).mean(dim=1)
++    chunks.append(mse.to(torch.float32).contiguous())
++    _record_candidate_pairs(stage, chunk_index, diff)
++
++
++def record_error_contribution_tensor(stage: str, tensor: torch.Tensor) -> torch.Tensor:
++    if not error_contribution_enabled() or not _stage_enabled(stage):
++        return tensor
++    if not torch.is_tensor(tensor):
++        return tensor
++    with torch.no_grad():
++        selected = _select_rows(stage, tensor)
++        if selected is None:
++            return tensor
++        mode = _mode()
++        if mode == _REFERENCE_MODE:
++            _record_reference(stage, selected)
++        elif mode == _CANDIDATE_MODE:
++            _record_candidate(stage, selected)
++    return tensor
++
++
++def _raw_payload_and_metadata() -> tuple[dict[str, torch.Tensor], dict[str, object]]:
++    payload: dict[str, torch.Tensor] = {}
++    metadata: dict[str, object] = {}
++    for stage, chunks in _TENSORS.items():
++        rows = []
++        multiple = len(chunks) > 1
++        for idx, tensor in enumerate(chunks):
++            key = f"{stage}__chunk_{idx:06d}" if multiple else stage
++            payload[key] = tensor
++            rows.append({"key": key, "shape": list(tensor.shape), "dtype": str(tensor.dtype)})
++        metadata[stage] = rows
++    return payload, metadata
++
++
++def _mse_payload() -> dict[str, object]:
++    stages: dict[str, torch.Tensor] = {}
++    metadata: dict[str, object] = {}
++    for stage, chunks in _MSE_TENSORS.items():
++        if not chunks:
++            continue
++        tensor = torch.cat(chunks, dim=0).to(torch.float32).contiguous()
++        stages[stage] = tensor
++        metadata[stage] = {
++            "shape": list(tensor.shape),
++            "dtype": str(tensor.dtype),
++            "chunks": len(chunks),
++        }
++    pairs: dict[str, torch.Tensor] = {}
++    pair_metadata: dict[str, object] = {}
++    for name, chunks in _PAIR_TENSORS.items():
++        if not chunks:
++            continue
++        tensor = torch.cat(chunks, dim=0).to(torch.float32).contiguous()
++        pairs[name] = tensor
++        pair_metadata[name] = {
++            "shape": list(tensor.shape),
++            "dtype": str(tensor.dtype),
++            "chunks": len(chunks),
++        }
++    candidate_tensors: dict[str, torch.Tensor] = {}
++    candidate_metadata: dict[str, object] = {}
++    for stage, chunks in _CANDIDATE_TENSORS.items():
++        if not chunks:
++            continue
++        tensor = torch.cat(chunks, dim=0).to(torch.float32).contiguous()
++        candidate_tensors[stage] = tensor
++        candidate_metadata[stage] = {
++            "shape": list(tensor.shape),
++            "dtype": str(tensor.dtype),
++            "chunks": len(chunks),
++        }
++    return {
++        "schema_version": 3,
++        "mode": _CANDIDATE_MODE,
++        "reference_file": _reference_file(),
++        "stages": stages,
++        "metadata": metadata,
++        "pairs": pairs,
++        "pair_metadata": pair_metadata,
++        "candidate_tensors": candidate_tensors,
++        "candidate_metadata": candidate_metadata,
++    }
++
++
++def flush_error_contribution_trace(
++    output_file: str | os.PathLike[str] | None = None,
++    *,
++    clear: bool = True,
++) -> None:
++    target = str(output_file) if output_file is not None else _output_file()
++    if not target:
++        return
++    path = Path(target)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    mode = _mode()
++    if mode == _REFERENCE_MODE:
++        payload, metadata = _raw_payload_and_metadata()
++        if payload:
++            save_file(payload, str(path))
++            path.with_suffix(path.suffix + ".meta.json").write_text(
++                json.dumps(metadata, indent=2, sort_keys=True) + "\n",
++                encoding="utf-8",
++            )
++    elif mode == _CANDIDATE_MODE and (_MSE_TENSORS or _PAIR_TENSORS or _CANDIDATE_TENSORS):
++        torch.save(_mse_payload(), path)
++    if clear:
++        clear_error_contribution_trace()
+diff --git a/vllm/model_executor/models/layercast_runtime.py b/vllm/model_executor/models/layercast_runtime.py
+new file mode 100644
+index 000000000..b4ae3b633
+--- /dev/null
++++ b/vllm/model_executor/models/layercast_runtime.py
+@@ -0,0 +1,40 @@
++# SPDX-License-Identifier: Apache-2.0
++"""LayerCast runtime gates for local experiments.
++
++This patch does not provide rounding or analyzer helpers. Detailed tensor dumps
++belong to the dedicated analyzer patches.
++"""
++
++from __future__ import annotations
++
++import os
++
++import torch
++
++
++def _env_enabled(name: str) -> bool:
++    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
++
++
++def _configure_float32_matmul_precision() -> None:
++    raw_precision = os.environ.get("VLLM_FLOAT32_MATMUL_PRECISION")
++    raw_tf32 = os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE")
++    if raw_precision:
++        try:
++            torch.set_float32_matmul_precision(raw_precision)
++        except Exception:
++            pass
++    if raw_tf32 is not None:
++        try:
++            allow_tf32 = raw_tf32.lower() in {"1", "true", "yes", "on"}
++            torch.backends.cuda.matmul.allow_tf32 = allow_tf32
++            torch.backends.cudnn.allow_tf32 = allow_tf32
++        except Exception:
++            pass
++
++
++_configure_float32_matmul_precision()
++
++
++def layercast_enabled() -> bool:
++    return _env_enabled("VLLM_LAYERCAST_FORCE_FP32")
+diff --git a/vllm/model_executor/models/tensor_trace.py b/vllm/model_executor/models/tensor_trace.py
+new file mode 100644
+index 000000000..132b53496
+--- /dev/null
++++ b/vllm/model_executor/models/tensor_trace.py
+@@ -0,0 +1,141 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Small env-gated tensor tracing hooks for local precision benchmarks."""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++from pathlib import Path
++from typing import Any
++
++import torch
++from safetensors.torch import save_file
++
++_TENSORS: dict[str, list[torch.Tensor]] = {}
++_TENSOR_METADATA: dict[str, list[dict[str, object]]] = {}
++_ROW_METADATA: dict[str, object] | None = None
++_ROW_METADATA_LIST_KEYS = {
++    "row_request_indices",
++    "row_token_positions",
++    "row_token_ids",
++}
++
++
++def _tensor_file() -> str:
++    return os.environ.get("TENSOR_TRACE_TENSOR_FILE") or os.environ.get(
++        "VLLM_TENSOR_TRACE_TENSOR_FILE", ""
++    )
++
++
++def tensor_trace_enabled() -> bool:
++    return bool(_tensor_file())
++
++
++def _stage_enabled(stage: str) -> bool:
++    pattern = os.environ.get("TENSOR_TRACE_STAGE_REGEX") or os.environ.get(
++        "VLLM_TENSOR_TRACE_STAGE_REGEX", ""
++    )
++    if not pattern:
++        return True
++    return re.search(pattern, stage) is not None
++
++
++def set_tensor_trace_row_metadata(metadata: dict[str, Any] | None) -> None:
++    global _ROW_METADATA
++    _ROW_METADATA = dict(metadata) if metadata is not None else None
++
++
++def clear_tensor_trace_row_metadata() -> None:
++    global _ROW_METADATA
++    _ROW_METADATA = None
++
++
++def clear_tensor_trace_tensors() -> None:
++    _TENSORS.clear()
++    _TENSOR_METADATA.clear()
++    clear_tensor_trace_row_metadata()
++
++
++def _row_metadata_for_tensor(row_count: int) -> dict[str, object] | None:
++    if _ROW_METADATA is None:
++        return None
++    metadata: dict[str, object] = {}
++    for key, value in _ROW_METADATA.items():
++        if key not in _ROW_METADATA_LIST_KEYS:
++            metadata[key] = value
++            continue
++        if not isinstance(value, list):
++            metadata[key] = value
++            continue
++        metadata[key] = value[:row_count]
++        if len(value) < row_count:
++            metadata.setdefault("metadata_row_mismatches", []).append(
++                {
++                    "key": key,
++                    "available_rows": len(value),
++                    "tensor_rows": row_count,
++                }
++            )
++    metadata["row_count"] = int(row_count)
++    return metadata
++
++
++def record_tensor_trace_tensor(stage: str, tensor: torch.Tensor) -> torch.Tensor:
++    if not tensor_trace_enabled() or not _stage_enabled(stage):
++        return tensor
++    if not torch.is_tensor(tensor):
++        return tensor
++    with torch.no_grad():
++        captured = tensor.detach()
++        if torch.is_floating_point(captured):
++            captured = captured.to(torch.float32)
++        captured = captured.cpu().contiguous().clone()
++    _TENSORS.setdefault(stage, []).append(captured)
++    if captured.ndim >= 1:
++        row_metadata = _row_metadata_for_tensor(int(captured.shape[0]))
++        if row_metadata is not None:
++            _TENSOR_METADATA.setdefault(stage, []).append(row_metadata)
++    return tensor
++
++
++def _payload_and_metadata() -> tuple[dict[str, torch.Tensor], dict[str, object]]:
++    payload: dict[str, torch.Tensor] = {}
++    metadata: dict[str, object] = {}
++    for stage, chunks in _TENSORS.items():
++        stage_rows = []
++        stage_row_metadata = _TENSOR_METADATA.get(stage, [])
++        for idx, tensor in enumerate(chunks):
++            key = f"{stage}__chunk_{idx:06d}" if len(chunks) > 1 else stage
++            payload[key] = tensor
++            row = {
++                "key": key,
++                "shape": list(tensor.shape),
++                "dtype": str(tensor.dtype),
++            }
++            if idx < len(stage_row_metadata):
++                row["row_metadata"] = stage_row_metadata[idx]
++            stage_rows.append(row)
++        metadata[stage] = stage_rows
++    return payload, metadata
++
++
++def flush_tensor_trace_tensors(
++    tensor_file: str | os.PathLike[str] | None = None,
++    *,
++    clear: bool = True,
++) -> None:
++    target = str(tensor_file) if tensor_file is not None else _tensor_file()
++    if not target:
++        return
++    payload, metadata = _payload_and_metadata()
++    if payload:
++        path = Path(target)
++        path.parent.mkdir(parents=True, exist_ok=True)
++        save_file(payload, str(path))
++        path.with_suffix(path.suffix + ".meta.json").write_text(
++            json.dumps(metadata, indent=2, sort_keys=True) + "\n",
++            encoding="utf-8",
++        )
++    if clear:
++        clear_tensor_trace_tensors()
